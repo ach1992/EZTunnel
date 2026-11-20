@@ -64,6 +64,7 @@ Agent exists. Run these on the **server hosting the Dashboard** (not on an Agent
 
 ```sh
 sudo eztunnel fleet servers                       # online/offline and current inventories (JSON)
+sudo eztunnel fleet --dashboard-address 10.0.0.2 servers  # explicit local bind when auto-discovery is unavailable
 sudo eztunnel fleet tunnels --server SERVER_ID
 sudo eztunnel fleet options                       # currently supported central-create transports
 sudo eztunnel fleet status TUNNEL --server SERVER_ID
@@ -84,6 +85,9 @@ sudo eztunnel fleet restart-all --server SERVER_ID
 sudo eztunnel fleet join-code                      # secret, single-use Agent enrollment code
 sudo eztunnel fleet remove-server SERVER_ID --confirm SERVER_ID
 sudo eztunnel fleet menu                           # interactive server and tunnel operations
+# Fleet CLI normally tries localhost then addresses assigned to this machine. For
+# `dashboard serve --listen ADDRESS`, it discovers the assigned IP; use
+# `--dashboard-address ADDRESS` if the bind is on an unusual local interface.
 ```
 
 `SERVER_ID` is an ID from `fleet servers`; `local` means the Dashboard host (and is the default).
@@ -256,8 +260,13 @@ saved or not, and the panel shows how the last message went. If Telegram is not 
 To open the dashboard without a browser warning, use a free Let's Encrypt certificate for the
 server's IP address or for a domain that points to it. In the **Settings → Dashboard access** panel,
 enter the domain or IP (without `https://` or a port), then select **Get certificate**. The form
-immediately confirms the request and shows its progress or detailed failure. After successful
-issuance the dashboard restarts, and you can open the new `https://domain:port` address (the port
+immediately confirms the request and shows its progress or detailed failure. The certificate,
+private key and selected address are stored together in one atomic settings update, so a failed
+attempt leaves the previously working configuration intact. With the installed systemd service,
+successful issuance restarts the dashboard. With `dashboard setup --no-service` and a manual
+`dashboard serve`, the Settings page explicitly reports **restart required**; issuing a
+certificate alone does not activate it. After restart, open the new `https://domain:port`
+address (the port
 is unchanged; the browser may ask you to sign in again). The dashboard retains its Noise identity
 so enrolled agents and tunnels are unaffected if their configured connection address remains reachable.
 Alternatively use **Tools → Web dashboard → Use a Let's Encrypt certificate**, or

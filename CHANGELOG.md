@@ -6,6 +6,7 @@
 - Dashboard Settings: configure domain or IP for Let's Encrypt, see progress/errors, restore self-signed certificate.
 - Fork-owned release sources and signing public key, with safe sync PR and explicit release workflows.
 - Update ordering respects fork-specific prerelease suffixes.
+- Review remediation: atomic certificate/domain/key persistence with failure recovery; the Settings page reports manual restart-required versus active; Fleet CLI discovers Dashboard non-loopback bindings and accepts `--dashboard-address`; release publishing enforces a reviewed signing public-key pin.
 
 ## 0.12.0 (2026-11-20)
 

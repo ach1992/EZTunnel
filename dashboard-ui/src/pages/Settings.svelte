@@ -142,9 +142,12 @@
     try {
       const { status, data } = await certificateStatus();
       if (status !== 200) return;
-      const wasRunning = certTask?.running;
+      const previous = certTask;
       certTask = data;
-      if (wasRunning && !data.running && !data.error) {
+      if (previous?.running && !data.running && !data.error) {
+        say(t(data.restart_required ? "certRestartRequired" : data.active ? "certApplied" : "certApplying"));
+        load();
+      } else if (previous?.restart_required && data.active) {
         say(t("certApplied"));
         load();
       }
@@ -252,6 +255,10 @@
         <p class="small warn-t mt12" role="status">{t("certWorking")}</p>
       {:else if certTask?.error}
         <div class="note bad mt12" role="alert">{t("certFailed")} <span class="ltr edesc">{certTask.error}</span></div>
+      {:else if certTask?.restart_required}
+        <div class="note warn mt12" role="status">{t("certRestartRequired")}</div>
+      {:else if certTask?.active && certTask?.configured_address}
+        <p class="small ok-t mt12" role="status">{t("certServing", certTask.configured_address)}</p>
       {/if}
       {#if nextUrl}
         <p class="small mt12">{t("certNext")} <a class="ltr" href={nextUrl} target="_blank" rel="noopener noreferrer">{nextUrl}</a></p>

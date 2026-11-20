@@ -139,6 +139,15 @@ fn non_fleet_parser_errors_stay_human_readable() {
 }
 
 #[test]
+fn fleet_dashboard_address_override_is_global_and_preserves_json_errors() {
+    let output = run(&["fleet", "--state-dir", "/nonexistent/eztunnel-r4-qa", "--dashboard-address", "127.0.0.2", "servers"]);
+    assert_eq!(output.status.code(), Some(7));
+    let data: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(data["error"], "dashboard_not_configured");
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn upstream_012_preset_and_rename_cli_shapes_reach_dashboard_client() {
     // A missing state directory is deliberately used: parse must succeed without
     // installing, logging in, or touching a tunnel.

@@ -129,6 +129,9 @@ enum Command {
         /// Read the Dashboard password from stdin (never pass credentials as CLI arguments).
         #[arg(long, global = true)]
         password_stdin: bool,
+        /// Local interface IP to reach the Dashboard when auto-discovery is insufficient.
+        #[arg(long, global = true)]
+        dashboard_address: Option<IpAddr>,
         #[command(subcommand)]
         action: FleetCommand,
     },
@@ -693,7 +696,7 @@ async fn run(cli: Cli) -> Result<()> {
             Command::Menu => eztunnel::manager::run()?,
             Command::Key => println!("{}", eztunnel::tunnel_key::TunnelKey::generate()?.display()),
             #[cfg(feature = "dashboard")]
-            Command::Fleet { state_dir, password_stdin, action } => {
+            Command::Fleet { state_dir, password_stdin, dashboard_address, action } => {
                 use eztunnel::dashboard::terminal::{self, Operation};
                 let operation = match action {
                     FleetCommand::Servers => Operation::Servers,
@@ -785,11 +788,11 @@ async fn run(cli: Cli) -> Result<()> {
                         form_file: form,
                     },
                     FleetCommand::Menu => {
-                        terminal::menu(&state_dir, password_stdin).await?;
+                        terminal::menu_at(&state_dir, password_stdin, dashboard_address).await?;
                         return Ok(());
                     }
                 };
-                match terminal::execute(&state_dir, password_stdin, operation).await {
+                match terminal::execute_at(&state_dir, password_stdin, dashboard_address, operation).await {
                     Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
                     Err(error) => {
                         eprintln!("{}", error.as_json());

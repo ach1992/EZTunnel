@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     io::{IsTerminal, Read},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -168,6 +169,13 @@ fn local_certificate_pins(state_dir: &Path) -> Result<Vec<[u8; 32]>> {
     if let Ok(der) = std::fs::read(state_dir.join("cert.der")) {
         digests.push(Sha256::digest(&der).into());
     }
+    if let Ok(settings) = load_settings(state_dir)
+        && let Some(wanted) = settings.acme.as_ref()
+        && let Some(cert) = super::acme::load_for(state_dir, wanted)
+        && let Some(first) = cert.chain.first()
+    {
+        digests.push(Sha256::digest(first.as_ref()).into());
+    }
     if let Ok(mut certs) = CertificateDer::pem_file_iter(state_dir.join("acme-chain.pem"))
         && let Some(Ok(cert)) = certs.next()
     {
@@ -180,6 +188,54 @@ fn local_certificate_pins(state_dir: &Path) -> Result<Vec<[u8; 32]>> {
         ));
     }
     Ok(digests)
+}
+
+/// Candidate addresses are only assigned to this host. Try loopback first (wildcard
+/// listening works there), then other interfaces for an explicit `--listen ADDRESS`.
+/// A user can also specify an exact address for unusual bindings.
+fn local_dashboard_addresses() -> Vec<IpAddr> {
+    let mut addresses = vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)];
+    let mut extra = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        let mut head = std::ptr::null_mut();
+        // SAFETY: libc owns the linked list until freeifaddrs. Each address is read
+        // only if its sockaddr family matches the corresponding concrete struct.
+        if unsafe { libc::getifaddrs(&mut head) } == 0 {
+            let mut node: *mut libc::ifaddrs = head;
+            while !node.is_null() {
+                let ptr = unsafe { (*node).ifa_addr };
+                if !ptr.is_null() {
+                    let family = unsafe { (*ptr).sa_family } as i32;
+                    let ip = match family {
+                        libc::AF_INET => {
+                            let addr = unsafe { &*(ptr as *const libc::sockaddr_in) };
+                            Some(IpAddr::V4(Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes())))
+                        }
+                        libc::AF_INET6 => {
+                            let addr = unsafe { &*(ptr as *const libc::sockaddr_in6) };
+                            let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
+                            // Link-local IPv6 requires the interface's scope ID; an explicit
+                            // --dashboard-address is available if a scoped bind is needed.
+                            (!ip.is_unicast_link_local()).then_some(IpAddr::V6(ip))
+                        }
+                        _ => None,
+                    };
+                    if let Some(ip) = ip.filter(|ip| !ip.is_unspecified() && !ip.is_multicast()) {
+                        extra.push(ip);
+                    }
+                }
+                node = unsafe { (*node).ifa_next };
+            }
+            unsafe { libc::freeifaddrs(head) };
+        }
+    }
+    extra.sort();
+    extra.dedup();
+    for ip in extra {
+        if !addresses.contains(&ip) { addresses.push(ip); }
+    }
+    addresses
 }
 
 fn password(from_stdin: bool) -> Result<String> {
@@ -214,33 +270,44 @@ fn password(from_stdin: bool) -> Result<String> {
 /// persistent CLI files, JSON results, or process logs.
 pub struct FleetClient {
     port: u16,
+    dashboard_address: Option<IpAddr>,
     tls: tokio_rustls::TlsConnector,
     cookie: Option<String>,
 }
 
 impl FleetClient {
     pub async fn connect(state_dir: &Path, from_stdin: bool) -> Result<Self> {
+        Self::connect_at(state_dir, from_stdin, None).await
+    }
+
+    pub async fn connect_at(state_dir: &Path, from_stdin: bool, dashboard_address: Option<IpAddr>) -> Result<Self> {
         let settings = load_settings(state_dir)
             .map_err(|e| FleetError::new("dashboard_not_configured", format!("{e:#}")))?;
         let pins = local_certificate_pins(state_dir)?;
         let mut secret = password(from_stdin)?;
-        let result = Self::connect_ready(settings, pins, &secret).await;
+        let result = Self::connect_ready(settings, pins, &secret, dashboard_address).await;
         secret.zeroize();
         result
     }
 
     #[cfg(test)]
     async fn connect_password(state_dir: &Path, password: &str) -> Result<Self> {
+        Self::connect_password_at(state_dir, password, None).await
+    }
+
+    #[cfg(test)]
+    async fn connect_password_at(state_dir: &Path, password: &str, dashboard_address: Option<IpAddr>) -> Result<Self> {
         let settings = load_settings(state_dir)
             .map_err(|e| FleetError::new("dashboard_not_configured", format!("{e:#}")))?;
         let pins = local_certificate_pins(state_dir)?;
-        Self::connect_ready(settings, pins, password).await
+        Self::connect_ready(settings, pins, password, dashboard_address).await
     }
 
     async fn connect_ready(
         settings: super::Settings,
         pins: Vec<[u8; 32]>,
         password: &str,
+        dashboard_address: Option<IpAddr>,
     ) -> Result<Self> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let config = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -254,6 +321,7 @@ impl FleetClient {
             .with_no_client_auth();
         let mut client = Self {
             port: settings.port,
+            dashboard_address,
             tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
             cookie: None,
         };
@@ -300,25 +368,38 @@ impl FleetClient {
         deadline: Duration,
     ) -> Result<(StatusCode, http::HeaderMap, Value)> {
         let port = self.port;
+        let dashboard_address = self.dashboard_address;
         let tls = self.tls.clone();
         let cookie = self.cookie.clone();
         let path = path.to_owned();
         tokio::time::timeout(deadline, async move {
-            let tcp = match TcpStream::connect(("127.0.0.1", port)).await {
-                Ok(stream) => stream,
-                Err(_) => TcpStream::connect(("::1", port)).await.map_err(|e| {
-                    FleetError::new(
-                        "dashboard_unavailable",
-                        format!("cannot connect to local dashboard port {port}: {e}"),
-                    )
-                })?,
-            };
+            let addresses = dashboard_address.map_or_else(local_dashboard_addresses, |host| vec![host]);
             let name = ServerName::try_from("localhost".to_string())
                 .map_err(|e| FleetError::new("tls", e))?;
-            let stream = tls
-                .connect(name, tcp)
-                .await
-                .map_err(|e| FleetError::new("tls", format!("dashboard TLS failed: {e}")))?;
+            let mut connected = None;
+            let mut last_failure = String::new();
+            let mut tls_failure = None;
+            for ip in &addresses {
+                let endpoint = SocketAddr::new(*ip, port);
+                match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(endpoint)).await {
+                    Ok(Ok(tcp)) => match tokio::time::timeout(Duration::from_secs(5), tls.connect(name.clone(), tcp)).await {
+                        Ok(Ok(stream)) => { connected = Some(stream); break; }
+                        Ok(Err(error)) => {
+                            tls_failure = Some(format!("dashboard TLS at {endpoint} failed: {error}"));
+                        },
+                        Err(_) => last_failure = format!("TLS handshake at {endpoint} timed out"),
+                    },
+                    Ok(Err(error)) => last_failure = format!("connect to {endpoint}: {error}"),
+                    Err(_) => last_failure = format!("connect to {endpoint} timed out"),
+                }
+            }
+            let stream = connected.ok_or_else(|| match tls_failure {
+                Some(detail) => FleetError::new("tls", detail),
+                None => FleetError::new(
+                    "dashboard_unavailable",
+                    format!("no authenticated dashboard on local port {port} ({} address(es) tried); {last_failure}. If listening on another local address, pass --dashboard-address ADDRESS", addresses.len()),
+                ),
+            })?;
             let (mut sender, connection) =
                 hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
                     .await
@@ -1041,6 +1122,10 @@ pub enum Operation {
 }
 
 pub async fn execute(state_dir: &Path, from_stdin: bool, operation: Operation) -> Result<Value> {
+    execute_at(state_dir, from_stdin, None, operation).await
+}
+
+pub async fn execute_at(state_dir: &Path, from_stdin: bool, dashboard_address: Option<IpAddr>, operation: Operation) -> Result<Value> {
     // All local validation precedes Dashboard authentication, and never consumes password stdin.
     if let Operation::Logs { lines, .. } = &operation
         && !(1..=super::ops::MAX_LINES).contains(lines)
@@ -1082,7 +1167,7 @@ pub async fn execute(state_dir: &Path, from_stdin: bool, operation: Operation) -
         } => Some(read_json_file(file)?),
         _ => None,
     };
-    let mut client = FleetClient::connect(state_dir, from_stdin).await?;
+    let mut client = FleetClient::connect_at(state_dir, from_stdin, dashboard_address).await?;
     let result = match operation {
         Operation::Servers => client.servers().await,
         Operation::Tunnels { server } => client.tunnels(&server).await,
@@ -1703,8 +1788,12 @@ async fn menu_tunnel(client: &FleetClient, server: &str, name: &str) -> AnyResul
 
 /// All interactive entries use exactly the same authenticated client and state as headless CLI.
 pub async fn menu(state_dir: &Path, from_stdin: bool) -> AnyResult<()> {
+    menu_at(state_dir, from_stdin, None).await
+}
+
+pub async fn menu_at(state_dir: &Path, from_stdin: bool, dashboard_address: Option<IpAddr>) -> AnyResult<()> {
     use crate::manager::ui;
-    let mut client = FleetClient::connect(state_dir, from_stdin).await?;
+    let mut client = FleetClient::connect_at(state_dir, from_stdin, dashboard_address).await?;
     let result = async {
         loop {
             ui::banner("Dashboard servers");
@@ -1910,6 +1999,69 @@ mod tests {
             assert!(checked > 0, "each endpoint should offer a supported performance preset");
             assert!(preset_changes(&editable, "not-a-preset").is_err());
         }
+    }
+
+    /// A real HTTPS listener on a chosen local IP must be reachable through the existing
+    /// Fleet API with the same strict local certificate pin, not a parallel control plane.
+    async fn check_dashboard_bound_to(ip: IpAddr, explicit: Option<IpAddr>) {
+        use super::super::{audit, auth, data, history, http, ops, tls};
+        let listener = std::net::TcpListener::bind(SocketAddr::new(ip, 0)).expect("test address is local");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let dir = tempfile::tempdir().unwrap();
+        let settings = super::super::Settings {
+            version: 1, port, password_hash: auth::hash_password("pw").unwrap(),
+            created: 1, acme: None, acme_certificate: None,
+        };
+        super::super::save_settings(dir.path(), &settings).unwrap();
+        let (tls_config, _) = tls::load_or_create(dir.path(), "localhost").unwrap();
+        let state = Arc::new(http::AppState {
+            history: Arc::new(history::History::new(Box::new(history::DemoStore { tunnels: vec![], started_minute: 0 }))),
+            auth: auth::Auth::new(settings.password_hash),
+            audit: audit::Audit::disabled(),
+            live: data::Live::start(Box::new(data::DemoSource::new()), None),
+            ops: Arc::new(ops::DemoOps::new(&[])),
+            busy: Default::default(), followers: Arc::new(tokio::sync::Semaphore::new(http::MAX_FOLLOWERS)),
+            fleet: None, public: (ip.to_string(), port),
+            agent_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            cert: None, certificate_task: Default::default(),
+            demo: false, secure: true, state_dir: dir.path().into(), alerts: Default::default(),
+        });
+        let addr = SocketAddr::new(ip, port);
+        let probe = if ip.is_unspecified() { SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port) } else { addr };
+        let task = tokio::spawn(async move { let _ = http::serve(state, addr, Some(tls_config)).await; });
+        let mut ready = false;
+        for _ in 0..100 {
+            if TcpStream::connect(probe).await.is_ok() { ready = true; break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready, "Dashboard listener must be ready on {addr}");
+        let mut client = FleetClient::connect_password_at(dir.path(), "pw", explicit).await.unwrap();
+        let authenticated = client.api(Method::GET, "/api/session").await.unwrap();
+        assert_eq!(authenticated["signed_in"], true);
+        client.logout().await;
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn fleet_auto_discovers_dashboard_on_explicit_non_loopback_bind() {
+        let Some(ip) = local_dashboard_addresses().into_iter().find(|ip| !ip.is_loopback()) else {
+            eprintln!("No non-loopback local IP is configured on this CI runner");
+            return;
+        };
+        check_dashboard_bound_to(ip, None).await;
+    }
+
+    #[tokio::test]
+    async fn fleet_explicit_endpoint_can_reach_non_default_loopback_bind() {
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        check_dashboard_bound_to(ip, Some(ip)).await;
+    }
+
+    #[tokio::test]
+    async fn fleet_default_wildcard_bind_remains_reachable_through_loopback() {
+        check_dashboard_bound_to(IpAddr::V4(Ipv4Addr::UNSPECIFIED), None).await;
     }
 
     #[tokio::test]
@@ -2294,6 +2446,7 @@ mod tests {
             password_hash: auth::hash_password("pw").unwrap(),
             created: 1,
             acme: None,
+            acme_certificate: None,
         };
         super::super::save_settings(dir.path(), &settings).unwrap();
         let (tls_config, _) = tls::load_or_create(dir.path(), "localhost").unwrap();

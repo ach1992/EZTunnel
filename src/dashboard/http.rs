@@ -1412,12 +1412,41 @@ async fn settings_get(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     .into_response()
 }
 
+/// Whether the live TLS resolver presents the certificate currently configured on disk.
+/// A manual `dashboard serve --no-service` does not restart by systemd, so a saved
+/// setting must never be mistaken for a certificate already active in this process.
+pub(super) fn certificate_is_active(state_dir: &std::path::Path, swap: Option<&super::tls::Swap>) -> Option<bool> {
+    let current = swap?.current();
+    let actual = current.cert.first()?.as_ref();
+    let configured = super::load_settings(state_dir).ok()?;
+    let expected = match configured.acme.as_ref() {
+        Some(wanted) => {
+            let issued = super::acme::load_for(state_dir, wanted)?;
+            let (_, until) = issued.validity().ok()?;
+            if until <= super::now() { return Some(false); }
+            issued.chain.first()?.as_ref().to_vec()
+        },
+        None => super::tls::self_signed_der(state_dir)?,
+    };
+    Some(actual == expected)
+}
+
 /// Configuring a domain may take several minutes (ACME HTTP-01). Keep the HTTP request
 /// short and expose progress/errors without risking a client timeout during the order.
 async fn certificate_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !state.signed_in(&headers) { return unauthorized(); }
     let task = state.certificate_task.lock().unwrap().clone();
-    Json(json!({"running": task.running, "error": task.error, "address": task.address})).into_response()
+    let active = certificate_is_active(&state.state_dir, state.cert.as_deref());
+    let configured_address = super::load_settings(&state.state_dir).ok()
+        .and_then(|settings| settings.acme.map(|wanted| wanted.address));
+    Json(json!({
+        "running": task.running,
+        "error": task.error,
+        "address": task.address,
+        "configured_address": configured_address,
+        "active": active == Some(true),
+        "restart_required": active == Some(false) && !task.running,
+    })).into_response()
 }
 
 async fn certificate_set(State(state): State<Arc<AppState>>, request: Request) -> Response {
@@ -2928,6 +2957,47 @@ mod tests {
         waiting.as_mut().enable();
         PATH_CANCEL.notify_waiters();
         tokio::time::timeout(Duration::from_secs(1), waiting).await.expect("Cancel reaches the search");
+    }
+
+    /// An authenticated API on a manually served dashboard reports that persistence
+    /// alone does not activate TLS. It reports active only after the presented pair
+    /// changes, just as a stop/start of `dashboard serve --no-service` would do.
+    #[tokio::test]
+    async fn manual_dashboard_certificate_status_distinguishes_saved_from_active() {
+        let (initial, mut state) = app().await;
+        drop(initial);
+        let dir = tempfile::tempdir().unwrap();
+        let swap = Arc::new(super::super::tls::Swap::self_signed(dir.path(), "127.0.0.1").unwrap());
+        super::super::save_settings(dir.path(), &super::super::Settings {
+            version: 1, port: 33001, password_hash: "unused".into(), created: 1,
+            acme: None, acme_certificate: None,
+        }).unwrap();
+        let configure = Arc::get_mut(&mut state).unwrap();
+        configure.cert = Some(swap.clone());
+        configure.state_dir = dir.path().to_path_buf();
+        configure.demo = false;
+        configure.secure = true;
+        let app = router(state);
+        let cookie = signed_in(&app).await;
+        let status = |cookie: &String| with_cookie(hyper::Request::get("/api/dashboard/certificate").body(Body::empty()).unwrap(), cookie);
+        let before = json_of(call(&app, status(&cookie)).await).await;
+        assert_eq!((before["active"].as_bool(), before["restart_required"].as_bool()), (Some(true), Some(false)));
+
+        let rcgen::CertifiedKey { cert, key_pair } = rcgen::generate_simple_self_signed(vec!["panel.example.com".into()]).unwrap();
+        let issued = super::super::acme::Issued {
+            chain: vec![rustls::pki_types::CertificateDer::from(cert.der().as_ref().to_vec())],
+            key: rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+        };
+        let wanted = super::super::acme::AcmeSettings { address: "panel.example.com".into(), staging: false };
+        super::super::change_certificate_settings(dir.path(), Some((wanted, &issued))).unwrap();
+        let pending = json_of(call(&app, status(&cookie)).await).await;
+        assert_eq!(pending["configured_address"], "panel.example.com");
+        assert_eq!((pending["active"].as_bool(), pending["restart_required"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(swap.current().cert[0].as_ref(), super::super::tls::self_signed_der(dir.path()).unwrap(), "manual process still presents old TLS");
+
+        assert!(super::super::acme::install_stored(dir.path(), &swap).is_some());
+        let active = json_of(call(&app, status(&cookie)).await).await;
+        assert_eq!((active["active"].as_bool(), active["restart_required"].as_bool()), (Some(true), Some(false)));
     }
 
     /// Domain controls are not public and the demo never mutates host TLS state.

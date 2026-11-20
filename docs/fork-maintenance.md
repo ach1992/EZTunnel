@@ -12,6 +12,14 @@ Before accepting a sync PR, verify the changes preserve the fork's Fleet CLI and
 
 This fork intentionally downloads only GitHub Releases from **ach1992/EZTunnel**, via `scripts/install-latest.sh`, Dashboard Maintenance and the auto-join bootstrap. The installed fork's program updater verifies an embedded **fork** Ed25519 release key (ID 1), not the upstream release key. An ordinary developer build with no `EZTUNNEL_RELEASE_PUBLIC_KEY_HEX` cannot authenticate files for updater installation; it can still run locally for development.
 
+**A first fork release is blocked until the reviewed, non-secret public key pin is filled in.**
+The checked-in `.github/release-public-key.hex` initially contains `UNPROVISIONED`. After
+creating the seed, derive the matching 32-byte Ed25519 public key locally, submit that **public**
+hex (64 lowercase characters) as a reviewed change to the pin file, and only then release. The
+workflow refuses to publish if the Actions signing seed does not match that reviewed identity.
+Changing only the Actions secret can never silently replace the trusted key of installed clients.
+An intentional rotation requires a separately reviewed signed-bridge migration.
+
 **The release signing secret has not been provisioned automatically.** The Owner must securely generate an Ed25519 private seed locally/offline, keep a recoverable private backup, and set GitHub Actions repository secret `EZTUNNEL_RELEASE_KEY_HEX` (hex-encoded, 32 bytes). Never commit, publish, print into logs or chat, or include this secret in executable assets. One possible local setup using OpenSSL and GitHub CLI:
 
 ```bash
@@ -21,6 +29,15 @@ openssl pkey -in ./eztunnel-fork-release-key.pem -outform DER |
   tail -c 32 | od -An -tx1 -v | tr -d ' \n' |
   gh secret set EZTUNNEL_RELEASE_KEY_HEX --repo ach1992/EZTunnel
 ```
+
+Derive the public hex locally and put **only that public value** in
+`.github/release-public-key.hex` via a separately reviewed commit:
+
+```bash
+openssl pkey -in ./eztunnel-fork-release-key.pem -pubout -outform DER | \
+  tail -c 32 | od -An -tx1 -v | tr -d ' \n'
+```
+Run `bash scripts/test-release-public-key.sh` to verify a changed secret cannot pass the pin gate.
 
 Keep the private key file outside the repository. The manual **Publish signed fork release** workflow derives only the public key, embeds it when building x86_64/ARM64, signs the binaries in a final publisher job, verifies the signature before publication, creates matching release archives and `SHA256SUMS`, and publishes a versioned release. It must be run on `main` **after** independent review, successful tests and explicit release authorization. If the secret is absent, the workflow fails before release; do not silently substitute upstream binaries or unsigned builds. Do not rotate the trusted public key without a deliberate migration plan for the installed fork versions.
 
@@ -36,7 +53,17 @@ The installer keeps a backup of an existing executable and does not restart tunn
 
 ## Dashboard domain
 
-Dashboard **Settings > Dashboard access** accepts a DNS hostname or IP without scheme/port and requests a Let's Encrypt certificate using the existing HTTP-01 issuing/renewal implementation. DNS must resolve to this host and **port 80** must be publicly reachable for issuing and renewing; the Dashboard's HTTPS port remains unchanged. A successful certificate change restarts the dashboard and the browser may need to sign in at the new hostname. Existing paired agents keep their stored Noise identity and configured connection addresses; do not silently rewrite their enrollment. The self-signed fallback remains available.
+Dashboard **Settings > Dashboard access** accepts a DNS hostname or IP without scheme/port and requests a Let's Encrypt certificate using the existing HTTP-01 issuing/renewal implementation. An issued certificate, its key and the configured address are stored as **one atomic, owner-private settings update**; a failed change leaves the previous working pair intact. Previously stored legacy certificate files can still be loaded when their actual SAN and key match the configured address. DNS must resolve to this host and **port 80** must be publicly reachable for issuing and renewing; the Dashboard's HTTPS port remains unchanged. With a running systemd Dashboard service, a successful certificate change requests a restart; with `dashboard setup --no-service` plus a manually executed `dashboard serve` process, the Settings API reports **restart_required** until the process is restarted with the saved certificate. The new certificate is called **active** only after the live TLS resolver presents the committed chain; the browser may need to sign in at the new hostname. Existing paired agents keep their stored Noise identity and configured connection addresses; do not silently rewrite their enrollment. The self-signed fallback remains available.
+
+## Local Fleet CLI endpoint selection
+
+Fleet CLI first authenticates the locally saved TLS certificate, then uses the same
+Dashboard API and authenticated session. It probes loopback first and then addresses
+assigned to local network interfaces so `dashboard serve --listen 10.0.0.2` remains
+manageable without changing source. Use `eztunnel fleet --dashboard-address 10.0.0.2 servers`
+when the bound local address cannot be auto-discovered; the certificate
+fingerprint check is not bypassed by this override. It does not create an alternate
+Agent management stack.
 
 ## Version bookkeeping
 

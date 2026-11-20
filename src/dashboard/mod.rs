@@ -55,6 +55,10 @@ struct Settings {
     /// A Let's Encrypt certificate for this address instead of the self-signed one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     acme: Option<acme::AcmeSettings>,
+    /// The issued chain, key and address are committed in one atomic settings write.
+    /// Old installations with no bundle still read their legacy ACME files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acme_certificate: Option<acme::SavedCertificate>,
 }
 
 fn settings_path(state_dir: &Path) -> PathBuf {
@@ -229,6 +233,7 @@ pub fn setup(state_dir: &Path, port: Option<u16>, service: bool) -> Result<()> {
         password_hash: auth::hash_password(&password)?,
         created: now(),
         acme: None,
+        acme_certificate: None,
     };
     let address = shown_address();
     tls::load_or_create(state_dir, &address)?;
@@ -348,7 +353,7 @@ pub fn summary(state_dir: &Path) -> Summary {
         None => "self-signed".to_string(),
         Some(wanted) => {
             let staging = if wanted.staging { ", staging" } else { "" };
-            match acme::load(state_dir).and_then(|issued| issued.validity().ok()) {
+            match acme::load_for(state_dir, wanted).and_then(|issued| issued.validity().ok()) {
                 Some((_, until)) => format!("Let's Encrypt for {}{staging}, valid until {}", wanted.address, acme::utc_text(until)),
                 None => format!("Let's Encrypt for {}{staging}, not issued yet", wanted.address),
             }
@@ -411,6 +416,11 @@ pub async fn serve(state_dir: &Path, listen: Option<IpAddr>) -> Result<()> {
     require_root()?;
     let settings = load_settings(state_dir)?;
     let swap = Arc::new(tls::Swap::self_signed(state_dir, &shown_address())?);
+    // Load the committed matching chain before accepting a TLS connection. Renewal is
+    // asynchronous but initial certificate selection must never race with the first client.
+    if settings.acme.is_some() && acme::install_stored(state_dir, &swap).is_none() {
+        eprintln!("Dashboard has no valid stored certificate for its configured address; using self-signed until renewal succeeds");
+    }
     let tls = tls::server_config(swap.clone())?;
     let audit = audit::Audit::open(&state_dir.join("audit.log"))?;
     let history = Arc::new(history::History::new(Box::new(history::FileStore::open(
@@ -464,37 +474,62 @@ pub async fn serve(state_dir: &Path, listen: Option<IpAddr>) -> Result<()> {
     http::serve(state, address, Some(tls)).await
 }
 
-/// Switches the dashboard to a Let's Encrypt certificate for `address` (this server's address
-/// when not given), ordering the first one now so a problem shows at once; or back to the
-/// self-signed certificate. The running dashboard uses the change after a restart.
+/// Replaces the certificate/address together. A rejected or interrupted write keeps
+/// the previous pair and domain usable across the next service restart.
+fn change_certificate_settings(state_dir: &Path, next: Option<(acme::AcmeSettings, &acme::Issued)>) -> Result<(Option<acme::AcmeSettings>, Option<acme::SavedCertificate>)> {
+    let replacement = next.map(|(wanted, issued)| {
+        acme::SavedCertificate::from_issued(&wanted, issued).map(|saved| (wanted, saved))
+    }).transpose()?;
+    update_settings(state_dir, |settings| {
+        let previous = (settings.acme.clone(), settings.acme_certificate.clone());
+        settings.acme = replacement.as_ref().map(|(wanted, _)| wanted.clone());
+        settings.acme_certificate = replacement.map(|(_, saved)| saved);
+        Ok(previous)
+    })
+}
+
+/// Issue first without modifying any active key or certificate, then atomically commit
+/// the matching certificate/key/domain as a single settings document. On service restart
+/// failure, restore the previous selection and attempt to bring it back online.
 pub async fn certificate(state_dir: &Path, lets_encrypt: bool, staging: bool, address: Option<String>) -> Result<()> {
     require_root()?;
     load_settings(state_dir)?;
-    if !lets_encrypt {
-        update_settings(state_dir, |settings| {
-            settings.acme = None;
+    let next = if lets_encrypt {
+        let address = certificate_address(&address.unwrap_or_else(shown_address))?;
+        ensure!(address != "SERVER-IP", "this server's address was not found; give it with --address");
+        let wanted = acme::AcmeSettings { address: address.clone(), staging };
+        println!("Asking Let's Encrypt for a certificate for {address}.");
+        println!("It checks this server over port 80, which must be free and open for about a minute.");
+        let issued = acme::issue(state_dir, &wanted, 80).await?;
+        let (_, until) = issued.validity()?;
+        let kind = if staging { " (staging, not trusted by browsers)" } else { "" };
+        println!("Certificate ready{kind}, valid until {}.", acme::utc_text(until));
+        Some((wanted, issued))
+    } else {
+        None
+    };
+    let selected = next.as_ref().map(|(wanted, _)| wanted.clone());
+    let old = change_certificate_settings(state_dir, next.as_ref().map(|(wanted, issued)| (wanted.clone(), issued)))?;
+    let text = if lets_encrypt { "the new certificate" } else { "the self-signed certificate" };
+    if let Err(failure) = service::apply(text) {
+        let rolled_back = update_settings(state_dir, |settings| {
+            ensure!(settings.acme == selected, "dashboard certificate settings changed concurrently; cannot roll back an unrelated change");
+            (settings.acme, settings.acme_certificate) = old;
             Ok(())
-        })?;
-        acme::forget(state_dir);
-        println!("The dashboard uses its self-signed certificate again.");
-        return service::apply("the self-signed certificate");
+        });
+        return match rolled_back {
+            Ok(()) => {
+                let restarted = service::apply("the previous certificate");
+                Err(failure.context(match restarted {
+                    Ok(()) => "dashboard restart failed; previous certificate configuration was restored".to_string(),
+                    Err(error) => format!("dashboard restart failed; previous configuration restored but restarting it also failed: {error:#}"),
+                }))
+            }
+            Err(error) => Err(failure.context(format!("dashboard restart failed and previous settings could not be restored: {error:#}"))),
+        };
     }
-    let address = certificate_address(&address.unwrap_or_else(shown_address))?;
-    ensure!(address != "SERVER-IP", "this server's address was not found; give it with --address");
-    let wanted = acme::AcmeSettings { address: address.clone(), staging };
-    println!("Asking Let's Encrypt for a certificate for {address}.");
-    println!("It checks this server over port 80, which must be free and open for about a minute.");
-    let issued = acme::issue(state_dir, &wanted, 80).await?;
-    let (_, until) = issued.validity()?;
-    // The order took a while: change only the certificate choice, on the settings of now.
-    update_settings(state_dir, |settings| {
-        settings.acme = Some(wanted);
-        Ok(())
-    })?;
-    let kind = if staging { " (staging, not trusted by browsers)" } else { "" };
-    println!("Certificate ready{kind}, valid until {}.", acme::utc_text(until));
-    println!("The dashboard renews it by itself from now on.");
-    service::apply("the new certificate")
+    println!("The dashboard renews its Let's Encrypt certificate automatically when configured.");
+    Ok(())
 }
 
 /// Serves the interface with sample data on the loopback address, over plain HTTP. Nothing on
@@ -562,6 +597,110 @@ fn audit_start(state: &http::AppState, address: SocketAddr) {
 mod tests {
     use super::*;
 
+    fn test_issued(domain: &str) -> acme::Issued {
+        let rcgen::CertifiedKey { cert, key_pair } = rcgen::generate_simple_self_signed(vec![domain.to_owned()]).unwrap();
+        acme::Issued {
+            chain: vec![rustls::pki_types::CertificateDer::from(cert.der().as_ref().to_vec())],
+            key: rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+        }
+    }
+
+    fn test_settings(state_dir: &Path) {
+        save_settings(state_dir, &Settings {
+            version: 1, port: 31337, password_hash: "unchanged".into(), created: 1,
+            acme: None, acme_certificate: None,
+        }).unwrap();
+    }
+
+    #[test]
+    fn certificate_change_is_atomic_across_domain_key_and_chain_and_survives_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        test_settings(dir.path());
+        let a = acme::AcmeSettings { address: "a.example.org".into(), staging: false };
+        let b = acme::AcmeSettings { address: "b.example.org".into(), staging: false };
+        let issued_a = test_issued(&a.address);
+        let issued_b = test_issued(&b.address);
+        change_certificate_settings(dir.path(), Some((a.clone(), &issued_a))).unwrap();
+        let saved_a = load_settings(dir.path()).unwrap();
+        assert_eq!(saved_a.acme, Some(a.clone()));
+        assert_eq!(saved_a.password_hash, "unchanged");
+        let swap = tls::Swap::self_signed(dir.path(), "127.0.0.1").unwrap();
+        assert_eq!(http::certificate_is_active(dir.path(), Some(&swap)), Some(false), "a manual --no-service dashboard still serves its previous certificate");
+        assert!(acme::install_stored(dir.path(), &swap).is_some());
+        assert_eq!(http::certificate_is_active(dir.path(), Some(&swap)), Some(true));
+        let original_der = swap.current().cert[0].as_ref().to_vec();
+
+        // Inject a settings persistence failure AFTER a successful simulated ACME issue.
+        // A temp-directory collision blocks the single-file atomic rename before any
+        // of the active address, key, or chain can be changed.
+        std::fs::create_dir(dir.path().join("settings.tmp")).unwrap();
+        assert!(change_certificate_settings(dir.path(), Some((b.clone(), &issued_b))).is_err());
+        assert_eq!(load_settings(dir.path()).unwrap().acme, Some(a.clone()));
+        let after_failed_restart = tls::Swap::self_signed(dir.path(), "127.0.0.1").unwrap();
+        assert!(acme::install_stored(dir.path(), &after_failed_restart).is_some());
+        assert_eq!(after_failed_restart.current().cert[0].as_ref(), original_der);
+        assert_eq!(http::certificate_is_active(dir.path(), Some(&after_failed_restart)), Some(true));
+        assert!(!dir.path().join("acme-chain.pem").exists(), "no separately writable active chain");
+        assert!(!dir.path().join("acme-key.der").exists(), "no separately writable active key");
+        std::fs::remove_dir(dir.path().join("settings.tmp")).unwrap();
+
+        // A bogus certificate/key combination is rejected before touching settings.
+        let mismatched = acme::Issued { chain: issued_b.chain.clone(), key: issued_a.key.clone_key() };
+        assert!(change_certificate_settings(dir.path(), Some((b.clone(), &mismatched))).is_err());
+        assert_eq!(load_settings(dir.path()).unwrap().acme, Some(a));
+        change_certificate_settings(dir.path(), Some((b.clone(), &issued_b))).unwrap();
+        assert_eq!(http::certificate_is_active(dir.path(), Some(&swap)), Some(false), "saving a domain change is not the same as applying TLS in a manually started dashboard");
+        let restarted = tls::Swap::self_signed(dir.path(), "127.0.0.1").unwrap();
+        assert!(acme::install_stored(dir.path(), &restarted).is_some());
+        assert_eq!(http::certificate_is_active(dir.path(), Some(&restarted)), Some(true));
+        assert_eq!(load_settings(dir.path()).unwrap().acme, Some(b));
+        change_certificate_settings(dir.path(), None).unwrap();
+        assert_eq!(http::certificate_is_active(dir.path(), Some(&restarted)), Some(false));
+        let fallback = tls::Swap::self_signed(dir.path(), "127.0.0.1").unwrap();
+        assert_eq!(http::certificate_is_active(dir.path(), Some(&fallback)), Some(true));
+    }
+
+    #[test]
+    fn ip_certificates_keep_the_original_ipv4_and_ipv6_capability() {
+        for address in ["203.0.113.10", "2001:db8::1"] {
+            let ip = address.parse().unwrap();
+            let mut params = rcgen::CertificateParams::default();
+            params.subject_alt_names.push(rcgen::SanType::IpAddress(ip));
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = params.self_signed(&key).unwrap();
+            let issued = acme::Issued {
+                chain: vec![rustls::pki_types::CertificateDer::from(cert.der().as_ref().to_vec())],
+                key: rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()),
+            };
+            let wanted = acme::AcmeSettings { address: address.into(), staging: false };
+            let saved = acme::SavedCertificate::from_issued(&wanted, &issued).unwrap();
+            assert_eq!(saved.issued_for(&wanted).unwrap().chain[0].as_ref(), cert.der().as_ref());
+        }
+    }
+
+    #[test]
+    fn legacy_certificate_must_match_the_saved_address_before_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        test_settings(dir.path());
+        let a = acme::AcmeSettings { address: "a.example.org".into(), staging: false };
+        let issued = test_issued(&a.address);
+        // Previous-version pair can be loaded only when it matches the configured SAN.
+        std::fs::write(dir.path().join("acme-key.der"), issued.key.secret_pkcs8_der()).unwrap();
+        let mut pem_text = String::new();
+        for cert in &issued.chain {
+            use base64::Engine;
+            pem_text.push_str("-----BEGIN CERTIFICATE-----\n");
+            pem_text.push_str(&base64::engine::general_purpose::STANDARD.encode(cert.as_ref()));
+            pem_text.push_str("\n-----END CERTIFICATE-----\n");
+        }
+        std::fs::write(dir.path().join("acme-chain.pem"), pem_text).unwrap();
+        update_settings(dir.path(), |s| { s.acme = Some(a.clone()); Ok(()) }).unwrap();
+        assert!(acme::load_for(dir.path(), &a).is_some());
+        let b = acme::AcmeSettings { address: "b.example.org".into(), staging: false };
+        update_settings(dir.path(), |s| { s.acme = Some(b.clone()); Ok(()) }).unwrap();
+        assert!(acme::load_for(dir.path(), &b).is_none());
+    }
+
     #[test]
     fn certificate_address_accepts_dns_and_ip_but_not_urls_or_invalid_labels() {
         assert_eq!(certificate_address(" Dashboard.Example.COM. ").unwrap(), "dashboard.example.com");
@@ -589,6 +728,7 @@ mod tests {
             password_hash: "x".into(),
             created: 1,
             acme: Some(acme::AcmeSettings { address: "203.0.113.10".into(), staging: true }),
+            acme_certificate: None,
         };
         save_settings(dir.path(), &settings).unwrap();
         let back = load_settings(dir.path()).unwrap();

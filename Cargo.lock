@@ -802,6 +802,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webpki-roots",
+ "x509-parser",
  "zeroize",
 ]
 

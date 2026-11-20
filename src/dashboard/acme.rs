@@ -14,6 +14,7 @@ use instant_acme::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, pem::PemObject};
 use serde::{Deserialize, Serialize};
+use x509_parser::{parse_x509_certificate, extensions::GeneralName};
 use std::{
     collections::HashMap,
     future::Future,
@@ -82,6 +83,58 @@ pub fn renew_time(not_before: u64, not_after: u64) -> u64 {
     not_before + not_after.saturating_sub(not_before) * 2 / 3
 }
 
+/// Certificate and signing key stored as one serialized unit alongside its domain.
+/// The whole dashboard settings file is atomically replaced, so no reader can see
+/// a new key paired with an old certificate or an old domain.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct SavedCertificate {
+    wanted: AcmeSettings,
+    chain: Vec<String>,
+    key: String,
+}
+
+impl SavedCertificate {
+    pub fn from_issued(wanted: &AcmeSettings, issued: &Issued) -> Result<Self> {
+        validate_for(issued, wanted)?;
+        Ok(Self {
+            wanted: wanted.clone(),
+            chain: issued.chain.iter().map(|cert| hex::encode(cert.as_ref())).collect(),
+            key: hex::encode(issued.key.secret_pkcs8_der()),
+        })
+    }
+
+    pub fn issued_for(&self, wanted: &AcmeSettings) -> Result<Issued> {
+        ensure!(&self.wanted == wanted, "certificate is for a different address or ACME environment");
+        let issued = Issued {
+            chain: self.chain.iter().map(|cert| hex::decode(cert).map(CertificateDer::from)).collect::<std::result::Result<_, _>>()?,
+            key: PrivatePkcs8KeyDer::from(hex::decode(&self.key)?),
+        };
+        validate_for(&issued, wanted)?;
+        Ok(issued)
+    }
+}
+
+/// Validates both halves as a usable TLS key pair and the certificate SAN identity.
+/// This is needed even when reloading older pre-bundle certificate files.
+fn validate_for(issued: &Issued, wanted: &AcmeSettings) -> Result<()> {
+    let certified = tls::certified(issued.chain.clone(), PrivateKeyDer::Pkcs8(issued.key.clone_key()))?;
+    certified.keys_match().context("certificate and private key do not match")?;
+    let leaf = issued.chain.first().context("empty certificate chain")?;
+    let (_, parsed) = parse_x509_certificate(leaf.as_ref()).context("unreadable X.509 certificate")?;
+    let sans = parsed.subject_alternative_name().context("inspect certificate SAN")?
+        .context("certificate has no subject alternative name")?;
+    let requested_ip = wanted.address.parse::<IpAddr>().ok();
+    let matched = sans.value.general_names.iter().any(|name| match (name, requested_ip) {
+        (GeneralName::DNSName(dns), None) => dns.eq_ignore_ascii_case(&wanted.address),
+        (GeneralName::IPAddress(bytes), Some(IpAddr::V4(ip))) => *bytes == ip.octets(),
+        (GeneralName::IPAddress(bytes), Some(IpAddr::V6(ip))) => *bytes == ip.octets(),
+        _ => false,
+    });
+    ensure!(matched, "certificate does not name {}", wanted.address);
+    Ok(())
+}
+
+/// Legacy certificate files from before the atomic settings bundle existed.
 pub fn load(state_dir: &Path) -> Option<Issued> {
     let chain = CertificateDer::pem_file_iter(state_dir.join(CHAIN_FILE))
         .ok()?
@@ -91,15 +144,17 @@ pub fn load(state_dir: &Path) -> Option<Issued> {
     (!chain.is_empty()).then_some(Issued { chain, key })
 }
 
-fn save(state_dir: &Path, pem_chain: &str, key: &[u8]) -> Result<()> {
-    super::write_private(&state_dir.join(KEY_FILE), key)?;
-    super::write_private(&state_dir.join(CHAIN_FILE), pem_chain.as_bytes())
-}
-
-/// Removes a stored Let's Encrypt certificate (going back to the self-signed one).
-pub fn forget(state_dir: &Path) {
-    let _ = std::fs::remove_file(state_dir.join(CHAIN_FILE));
-    let _ = std::fs::remove_file(state_dir.join(KEY_FILE));
+/// Read the committed pair only when its identity agrees with the committed settings.
+/// Legacy files remain readable but are rejected if their SAN or key is inconsistent.
+pub(super) fn load_for(state_dir: &Path, wanted: &AcmeSettings) -> Option<Issued> {
+    let settings = super::load_settings(state_dir).ok()?;
+    if settings.acme.as_ref() != Some(wanted) { return None; }
+    if let Some(bundle) = settings.acme_certificate {
+        return bundle.issued_for(wanted).ok();
+    }
+    let legacy = load(state_dir)?;
+    validate_for(&legacy, wanted).ok()?;
+    Some(legacy)
 }
 
 /// HTTPS for the ACME requests over the program's own TLS stack and bundled root certificates.
@@ -268,8 +323,8 @@ fn challenge_answer(answers: &Answers, path: &str) -> Option<String> {
     answers.lock().unwrap().get(token).cloned()
 }
 
-/// Orders a certificate for `settings.address` and stores it. `port` is where the HTTP-01
-/// answers are served (80, except in tests).
+/// Orders a certificate for `settings.address` without touching the active certificate.
+/// Persistence is a separate, atomic settings transaction after validation.
 pub async fn issue(state_dir: &Path, settings: &AcmeSettings, port: u16) -> Result<Issued> {
     let ip = settings.address.parse::<IpAddr>().ok();
     let identifier = match ip {
@@ -336,7 +391,6 @@ pub async fn issue(state_dir: &Path, settings: &AcmeSettings, port: u16) -> Resu
         .map_err(|error| anyhow!("unreadable certificate: {error:?}"))?;
     ensure!(!chain.is_empty(), "the certificate service sent no certificate");
     let key_der = key.serialize_der();
-    save(state_dir, &pem, &key_der)?;
     Ok(Issued {
         chain,
         key: PrivatePkcs8KeyDer::from(key_der),
@@ -345,7 +399,9 @@ pub async fn issue(state_dir: &Path, settings: &AcmeSettings, port: u16) -> Resu
 
 /// Serves the stored certificate if it is still valid, else keeps what `swap` has.
 pub fn install_stored(state_dir: &Path, swap: &Swap) -> Option<u64> {
-    let issued = load(state_dir)?;
+    let settings = super::load_settings(state_dir).ok()?;
+    let wanted = settings.acme.as_ref()?;
+    let issued = load_for(state_dir, wanted)?;
     let (_, until) = issued.validity().ok()?;
     if until <= super::now() {
         return None;
@@ -369,6 +425,14 @@ pub async fn keep_renewed(
         if super::now() >= renew_at {
             match issue(&state_dir, &settings, 80).await.and_then(|issued| {
                 let next = issued.renew_at()?;
+                let bundle = SavedCertificate::from_issued(&settings, &issued)?;
+                // Another CLI process may have chosen a different domain during issuance.
+                // Never publish that obsolete renewal or overwrite its configuration.
+                super::update_settings(&state_dir, |current| {
+                    ensure!(current.acme.as_ref() == Some(&settings), "dashboard certificate target changed while renewing");
+                    current.acme_certificate = Some(bundle);
+                    Ok(())
+                })?;
                 swap.set(tls::certified(issued.chain, PrivateKeyDer::Pkcs8(issued.key))?);
                 Ok(next)
             }) {
@@ -536,46 +600,43 @@ mod tests {
         let date = |offset_days: i64| {
             let secs = now + offset_days * 86_400;
             let days = secs.div_euclid(86_400);
-            // Back from days to a civil date by searching around the estimate.
             let mut year = 1970 + (days / 366) as i32;
-            while days_from_civil(year as i64 + 1, 1, 1) <= days {
-                year += 1;
-            }
+            while days_from_civil(year as i64 + 1, 1, 1) <= days { year += 1; }
             let mut month = 1u8;
-            while month < 12 && days_from_civil(year as i64, month as i64 + 1, 1) <= days {
-                month += 1;
-            }
+            while month < 12 && days_from_civil(year as i64, month as i64 + 1, 1) <= days { month += 1; }
             let day = (days - days_from_civil(year as i64, month as i64, 1) + 1) as u8;
             (year, month, day)
         };
-        let (der, key) = certificate(date(-1), date(5));
-        let pem = format!(
-            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &der)
-        );
-        save(dir.path(), &pem, &key.serialize_der()).unwrap();
+        let wanted = AcmeSettings { address: "localhost".into(), staging: false };
+        let issued_at = |from: i64, until: i64| {
+            let (der, key) = certificate(date(from), date(until));
+            Issued { chain: vec![CertificateDer::from(der)], key: PrivatePkcs8KeyDer::from(key.serialize_der()) }
+        };
+        let valid = issued_at(-1, 5);
+        super::super::save_settings(dir.path(), &super::super::Settings {
+            version: 1, port: 1234, password_hash: "hash".into(), created: 1,
+            acme: Some(wanted.clone()),
+            acme_certificate: Some(SavedCertificate::from_issued(&wanted, &valid).unwrap()),
+        }).unwrap();
         let swap = Swap::self_signed(dir.path(), "203.0.113.10").unwrap();
         let before = swap.current();
         let renew = install_stored(dir.path(), &swap).expect("valid certificate installed");
         assert!(!Arc::ptr_eq(&before, &swap.current()), "the served certificate changed");
-        assert_eq!(swap.current().cert[0].as_ref(), der.as_slice());
+        assert_eq!(swap.current().cert[0].as_ref(), valid.chain[0].as_ref());
         assert!(renew > now as u64 && renew < (now + 5 * 86_400) as u64);
-        #[cfg(unix)]
-        {
+        #[cfg(unix)] {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.path().join(KEY_FILE)).unwrap().permissions().mode();
+            let mode = std::fs::metadata(dir.path().join("settings.json")).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        // An expired one is not served.
-        let (der, key) = certificate(date(-10), date(-1));
-        let pem = format!(
-            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &der)
-        );
-        save(dir.path(), &pem, &key.serialize_der()).unwrap();
+        // An expired certificate is never installed; no legacy pair is written.
+        let expired = issued_at(-10, -1);
+        super::super::update_settings(dir.path(), |settings| {
+            settings.acme_certificate = Some(SavedCertificate::from_issued(&wanted, &expired)?);
+            Ok(())
+        }).unwrap();
         let swap = Swap::self_signed(dir.path(), "203.0.113.10").unwrap();
         assert!(install_stored(dir.path(), &swap).is_none());
-        forget(dir.path());
         assert!(load(dir.path()).is_none());
     }
 
