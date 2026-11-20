@@ -644,6 +644,7 @@ checksum = "25f104b501bf2364e78d0d3974cbc774f738f5865306ed128e1e0d7499c0ad96"
 dependencies = [
  "console",
  "shell-words",
+ "zeroize",
 ]
 
 [[package]]
@@ -756,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "eztunnel"
-version = "0.11.0"
+version = "0.12.0-ach.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -786,6 +787,7 @@ dependencies = [
  "p256",
  "rcgen 0.13.2",
  "rustls",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -800,6 +802,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webpki-roots",
+ "x509-parser",
  "zeroize",
 ]
 

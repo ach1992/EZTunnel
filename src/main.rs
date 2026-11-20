@@ -37,6 +37,18 @@ enum Command {
     Menu,
     /// Print a fresh tunnel key to share between the two servers.
     Key,
+    /// Show what each preset (balanced, many-users, gaming, streaming, max-capacity) would change
+    /// in a tunnel configuration, or apply one: the result is printed, or saved with --write
+    /// (restart the tunnel afterwards). Set the same preset on both servers of a tunnel.
+    Preset {
+        /// The tunnel's configuration file.
+        config: PathBuf,
+        /// The preset to apply; without it every preset and its changes are listed.
+        preset: Option<String>,
+        /// Save the result in the configuration file instead of printing it.
+        #[arg(long, requires = "preset")]
+        write: bool,
+    },
     /// Show (or with --apply set) kernel network settings that help long-distance tunnels,
     /// such as BBR. --undo restores the previous values.
     Optimize {
@@ -109,6 +121,20 @@ enum Command {
         #[command(subcommand)]
         action: DashboardCommand,
     },
+    /// Manage Dashboard-enrolled servers from this server's terminal or headless CLI.
+    #[cfg(feature = "dashboard")]
+    Fleet {
+        #[arg(long, global = true, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
+        /// Read the Dashboard password from stdin (never pass credentials as CLI arguments).
+        #[arg(long, global = true)]
+        password_stdin: bool,
+        /// Local interface IP to reach the Dashboard when auto-discovery is insufficient.
+        #[arg(long, global = true)]
+        dashboard_address: Option<IpAddr>,
+        #[command(subcommand)]
+        action: FleetCommand,
+    },
     /// Let a dashboard on another server manage this server's tunnels.
     #[cfg(feature = "dashboard")]
     Agent {
@@ -123,6 +149,147 @@ enum Command {
         #[arg(long, default_value = "localhost")]
         name: Vec<String>,
     },
+}
+
+#[cfg(feature = "dashboard")]
+#[derive(Subcommand)]
+enum FleetCommand {
+    /// List enrolled servers, last-seen information and the local snapshot.
+    Servers,
+    /// List tunnels on the central host or an enrolled server.
+    Tunnels {
+        #[arg(long, default_value = "local")]
+        server: String,
+    },
+    /// List the supported new-tunnel transport types and their options.
+    Options,
+    /// Create and start both ends of a tunnel using a Web-compatible JSON form file.
+    Create {
+        #[arg(long)]
+        form: PathBuf,
+    },
+    /// Start one tunnel, or both paired endpoints if --both is set.
+    Start {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        #[arg(long)]
+        both: bool,
+    },
+    /// Stop one tunnel, or both paired endpoints if --both is set.
+    Stop {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        #[arg(long)]
+        both: bool,
+    },
+    /// Restart one tunnel, or stop and start its two paired endpoints in safe order.
+    Restart {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        #[arg(long)]
+        both: bool,
+    },
+    /// Current tunnel status from the Dashboard snapshot.
+    Status {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        /// Query the live control socket instead of inventory.
+        #[arg(long)]
+        live: bool,
+    },
+    /// Read the recent log of a tunnel.
+    Logs {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        #[arg(long, default_value_t = 40)]
+        lines: usize,
+    },
+    /// Read editable tunnel settings and available ranges.
+    Settings {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+    },
+    /// Preview or apply a 0.12 performance preset on an enrolled server's tunnel.
+    Preset {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        /// Balanced, many-users, gaming, streaming, or max-capacity.
+        #[arg(long)]
+        preset: String,
+        /// Apply the previewed settings; without this, no tunnel changes are made.
+        #[arg(long)]
+        write: bool,
+    },
+    /// Apply a Web-compatible JSON changes file, reverting if the service fails.
+    Edit {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        #[arg(long)]
+        changes: PathBuf,
+    },
+    /// Restore the previous tunnel configuration on the chosen server.
+    Undo {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+    },
+    /// Delete a tunnel and its owned resources; --both deletes the matching pair.
+    Delete {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        #[arg(long)]
+        both: bool,
+        #[arg(long)]
+        expect_pair: Option<String>,
+        #[arg(long)]
+        confirm: String,
+    },
+    /// Generate a single-use Agent enrollment code (secret: protect stdout).
+    JoinCode,
+    /// Rename an enrolled server in the central dashboard (display only).
+    RenameServer {
+        id: String,
+        /// Display name; an empty value resets to the server's reported name.
+        #[arg(long)]
+        name: String,
+    },
+    /// Forget an enrolled Agent without deleting its tunnels.
+    RemoveServer {
+        id: String,
+        #[arg(long)]
+        confirm: String,
+    },
+    /// Health diagnostics for the chosen server.
+    Health {
+        #[arg(long, default_value = "local")]
+        server: String,
+    },
+    /// Restart every tunnel on the chosen server, sequentially.
+    RestartAll {
+        #[arg(long, default_value = "local")]
+        server: String,
+    },
+    /// Run an existing allowlisted tunnel tool.
+    Tool {
+        name: String,
+        #[arg(long, default_value = "local")]
+        server: String,
+        #[arg(value_parser = ["speedtest", "pairing", "quota_reset"])]
+        tool: String,
+        #[arg(long)]
+        form: Option<PathBuf>,
+    },
+    /// Open the interactive Dashboard server and tunnel manager.
+    Menu,
 }
 
 #[cfg(feature = "dashboard")]
@@ -198,6 +365,17 @@ enum DashboardCommand {
         /// Use Let's Encrypt's staging service (for testing; browsers do not trust it).
         #[arg(long)]
         staging: bool,
+        #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
+    },
+    /// Restore the previous certificate selection after an interrupted activation.
+    RecoverCertificate {
+        #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
+    },
+    /// Internal systemd worker; not a user-facing command.
+    #[command(hide = true)]
+    CertificateActivationWorker {
         #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
         state_dir: PathBuf,
     },
@@ -448,8 +626,58 @@ fn example(mode: ExampleMode) -> serde_json::Value {
     }
 }
 
+#[cfg(feature = "dashboard")]
+fn fleet_argument_error(detail: impl std::fmt::Display) -> ! {
+    eprintln!("{}", serde_json::json!({
+        "ok": false, "error": "invalid_input",
+        "detail": detail.to_string(), "http_status": null,
+    }));
+    std::process::exit(2);
+}
+
+/// Identify the root subcommand when Clap has rejected the arguments.
+#[cfg(feature = "dashboard")]
+fn fleet_command_in_argv() -> bool {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("fleet") => return true,
+            // Values for the known root options are not subcommands, even if "fleet".
+            Some("-c" | "--config" | "--gen") => match args.next() {
+                // A new option means the previous option is missing its value.
+                // Clap rejects that root invocation before any Fleet command.
+                Some(value) if !value.to_string_lossy().starts_with('-') => {}
+                _ => return false,
+            },
+            // Past "--", Clap does not recognize another root subcommand.
+            Some("--") => return false,
+            // Unknown flags can fail Clap before it reaches a later fleet subcommand.
+            Some(word) if word.starts_with('-') => {}
+            // Another root subcommand must retain human-readable Clap errors.
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Other commands keep Clap's familiar human-readable help and errors.
+    // Fleet is a machine-oriented JSON interface, including argument failures.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            #[cfg(feature = "dashboard")]
+            if fleet_command_in_argv()
+                && !matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                )
+            {
+                fleet_argument_error(error);
+            }
+            error.exit();
+        }
+    };
     // A running tunnel uses the thread count from its configuration; the other commands are short.
     let workers = match (&cli.config, &cli.command, cli.check) {
         (Some(path), None, false) => Config::load(path).ok().map(|config| config.worker_threads),
@@ -468,13 +696,121 @@ fn main() -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     if let Some(command) = cli.command {
-        anyhow::ensure!(
-            cli.config.is_none() && cli.r#gen.is_none() && !cli.check,
-            "subcommands cannot be combined with configuration options"
-        );
+        if cli.config.is_some() || cli.r#gen.is_some() || cli.check {
+            #[cfg(feature = "dashboard")]
+            if matches!(&command, Command::Fleet { .. }) {
+                fleet_argument_error("subcommands cannot be combined with configuration options");
+            }
+            anyhow::bail!("subcommands cannot be combined with configuration options");
+        }
         match command {
             Command::Menu => eztunnel::manager::run()?,
             Command::Key => println!("{}", eztunnel::tunnel_key::TunnelKey::generate()?.display()),
+            #[cfg(feature = "dashboard")]
+            Command::Fleet { state_dir, password_stdin, dashboard_address, action } => {
+                use eztunnel::dashboard::terminal::{self, Operation};
+                let operation = match action {
+                    FleetCommand::Servers => Operation::Servers,
+                    FleetCommand::Tunnels { server } => Operation::Tunnels { server },
+                    FleetCommand::Options => Operation::Options,
+                    FleetCommand::Create { form } => Operation::Create { form_file: form },
+                    FleetCommand::Start { name, server, both } => Operation::Action {
+                        server,
+                        tunnel: name,
+                        action: "start",
+                        both,
+                    },
+                    FleetCommand::Stop { name, server, both } => Operation::Action {
+                        server,
+                        tunnel: name,
+                        action: "stop",
+                        both,
+                    },
+                    FleetCommand::Restart { name, server, both } => Operation::Action {
+                        server,
+                        tunnel: name,
+                        action: "restart",
+                        both,
+                    },
+                    FleetCommand::Status { name, server, live } => Operation::Status {
+                        server, tunnel: name, live,
+                    },
+                    FleetCommand::Logs {
+                        name,
+                        server,
+                        lines,
+                    } => Operation::Logs {
+                        server,
+                        tunnel: name,
+                        lines,
+                    },
+                    FleetCommand::Settings { name, server } => Operation::Settings {
+                        server,
+                        tunnel: name,
+                    },
+                    FleetCommand::Preset { name, server, preset, write } => Operation::Preset {
+                        server, tunnel: name, preset, write,
+                    },
+                    FleetCommand::Edit {
+                        name,
+                        server,
+                        changes,
+                    } => Operation::Edit {
+                        server,
+                        tunnel: name,
+                        changes_file: changes,
+                    },
+                    FleetCommand::Undo { name, server } => Operation::Undo {
+                        server,
+                        tunnel: name,
+                    },
+                    FleetCommand::Delete {
+                        name,
+                        server,
+                        both,
+                        expect_pair,
+                        confirm,
+                    } => Operation::Delete {
+                        server,
+                        tunnel: name,
+                        both,
+                        expected_pair: expect_pair,
+                        confirm,
+                    },
+                    FleetCommand::JoinCode => Operation::JoinCode,
+                    FleetCommand::RenameServer { id, name } => Operation::RenameServer {
+                        server: id, name,
+                    },
+                    FleetCommand::RemoveServer { id, confirm } => Operation::RemoveServer {
+                        server: id,
+                        confirm,
+                    },
+                    FleetCommand::Health { server } => Operation::Health { server },
+                    FleetCommand::RestartAll { server } => Operation::RestartAll { server },
+                    FleetCommand::Tool {
+                        name,
+                        server,
+                        tool,
+                        form,
+                    } => Operation::Tool {
+                        server,
+                        tunnel: name,
+                        tool,
+                        form_file: form,
+                    },
+                    FleetCommand::Menu => {
+                        terminal::menu_at(&state_dir, password_stdin, dashboard_address).await?;
+                        return Ok(());
+                    }
+                };
+                match terminal::execute_at(&state_dir, password_stdin, dashboard_address, operation).await {
+                    Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
+                    Err(error) => {
+                        eprintln!("{}", error.as_json());
+                        std::process::exit(error.exit_code());
+                    }
+                }
+            }
             #[cfg(feature = "dashboard")]
             Command::Agent { action } => match action {
                 AgentCommand::Join { code } => eztunnel::dashboard::agent_join(&code).await?,
@@ -491,6 +827,8 @@ async fn run(cli: Cli) -> Result<()> {
                 DashboardCommand::Certificate { lets_encrypt, self_signed: _, address, staging, state_dir } => {
                     eztunnel::dashboard::certificate(&state_dir, lets_encrypt, staging, address).await?
                 }
+                DashboardCommand::RecoverCertificate { state_dir } => eztunnel::dashboard::recover_certificate(&state_dir).await?,
+                DashboardCommand::CertificateActivationWorker { state_dir } => eztunnel::dashboard::activate_certificate_worker(&state_dir).await?,
                 DashboardCommand::ResetPassword { state_dir } => eztunnel::dashboard::reset_password(&state_dir)?,
                 DashboardCommand::Demo { port, empty } => eztunnel::dashboard::demo(port, empty).await?,
             },
@@ -752,6 +1090,33 @@ async fn run(cli: Cli) -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&eztunnel::settings::all())?
                 );
+            }
+            Command::Preset { config, preset, write } => {
+                use eztunnel::manager::presets::{self, Capacity, Preset};
+                let text = std::fs::read_to_string(&config).with_context(|| format!("read {}", config.display()))?;
+                let value: serde_json::Value = serde_json::from_str(&text).context("the configuration is not valid JSON")?;
+                let capacity = Capacity::here();
+                match preset {
+                    None => println!("{}", serde_json::to_string_pretty(&presets::listed(&value, capacity))?),
+                    Some(id) => {
+                        let names = Preset::ALL.map(|p| p.id()).join(", ");
+                        let chosen = Preset::from_id(&id).with_context(|| format!("unknown preset {id}; use one of {names}"))?;
+                        let edited = serde_json::to_string_pretty(&presets::apply(&value, chosen, capacity)?)? + "\n";
+                        if write {
+                            let temporary = config.with_extension("preset-new");
+                            std::fs::write(&temporary, &edited).with_context(|| format!("write {}", temporary.display()))?;
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+                            }
+                            std::fs::rename(&temporary, &config).with_context(|| format!("replace {}", config.display()))?;
+                            eprintln!("{} saved in {}; restart the tunnel to use it", chosen.label(), config.display());
+                        } else {
+                            print!("{edited}");
+                        }
+                    }
+                }
             }
             Command::Token => {
                 println!("{}", eztunnel::config::generate_token()?);

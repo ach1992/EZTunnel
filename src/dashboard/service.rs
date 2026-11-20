@@ -13,7 +13,7 @@ fn unit_path() -> PathBuf {
 }
 
 /// The program the service runs: the installed one when there is one, so an update reaches it.
-fn program() -> Result<PathBuf> {
+pub(super) fn program() -> Result<PathBuf> {
     let installed = Path::new(crate::manager::update::INSTALLED);
     if installed.exists() {
         return Ok(installed.to_path_buf());
@@ -62,6 +62,18 @@ pub fn stop() -> Result<()> {
 
 pub fn restart() -> Result<()> {
     systemctl(&["restart", UNIT])
+}
+/// A failed replacement startup may trip systemd's start-limit before recovery.
+/// Inactive/unloaded installed units cannot be reset, but can be restarted.
+pub(super) fn reset_failed() -> Result<()> {
+    let failed = Command::new("systemctl")
+        .args(["is-failed", "--quiet", UNIT])
+        .status()
+        .context("check Dashboard systemd failed state")?;
+    if failed.success() {
+        systemctl(&["reset-failed", UNIT])?;
+    }
+    Ok(())
 }
 
 /// Stops the service and removes it. The settings stay unless the caller deletes them.

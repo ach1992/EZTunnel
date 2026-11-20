@@ -1,0 +1,44 @@
+name: Propose upstream sync
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+concurrency:
+  group: eztunnel-fork-upstream-sync
+  cancel-in-progress: false
+jobs:
+  propose:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Merge upstream into a new review branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pending=$(gh pr list --base main --state open --json headRefName --jq '.[] | select(.headRefName | startswith("sync/upstream-")) | .headRefName' | head -n1)
+          if [[ -n "$pending" ]]; then echo "Existing sync PR ($pending) must be reviewed first."; exit 0; fi
+          git remote add upstream https://github.com/B3hnamR/EZTunnel.git
+          git fetch --no-tags upstream main
+          git fetch origin main
+          if git merge-base --is-ancestor upstream/main origin/main; then echo 'Fork already includes upstream main.'; exit 0; fi
+          sha=$(git rev-parse --short=12 upstream/main)
+          branch="sync/upstream-$sha"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$branch" origin/main
+          if ! git merge --no-ff --no-edit upstream/main; then
+            git merge --abort || true
+            echo "::error::Upstream $sha conflicts with fork main. Resolve manually on an isolated branch; never reset fork main."
+            exit 1
+          fi
+          git push origin "HEAD:refs/heads/$branch"
+          gh pr create --base main --head "$branch" --title "chore: merge upstream EZTunnel $sha" --body "Merge proposal for upstream B3hnamR/EZTunnel main commit $(git rev-parse upstream/main). Check domain control, Fleet CLI, update source/signing key, Cargo version and generated dashboard assets. Never auto-merge or auto-release."
+          # GITHUB_TOKEN-created PRs and pushes do not trigger other workflows.
+          gh workflow run ci.yml --ref "$branch"

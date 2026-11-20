@@ -46,6 +46,13 @@ const ALL: &str = "*";
 /// How long a signed-in browser may take to upload a file.
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(15 * 60);
 
+#[derive(Default, Clone)]
+pub struct CertificateTask {
+    pub running: bool,
+    pub error: Option<String>,
+    pub address: Option<String>,
+}
+
 pub struct AppState {
     pub history: Arc<super::history::History>,
     pub auth: auth::Auth,
@@ -64,6 +71,7 @@ pub struct AppState {
     pub agent_slots: Arc<Semaphore>,
     /// The certificate being served (HTTPS only): join commands pin its key.
     pub cert: Option<Arc<super::tls::Swap>>,
+    pub certificate_task: Mutex<CertificateTask>,
     pub demo: bool,
     /// HTTPS: cookies are marked Secure and carry the __Host- prefix.
     pub secure: bool,
@@ -129,6 +137,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/join-codes", post(join_code))
         .route("/api/servers/{id}", axum::routing::delete(remove_server))
         .route("/api/servers/{id}/restart-all", post(server_restart_all))
+        .route("/api/servers/{id}/name", post(server_rename))
         .route("/api/servers/{id}/tunnels/{name}/logs", get(server_logs))
         .route("/api/servers/{id}/tunnels/{name}/logs/follow", get(server_follow))
         .route("/api/servers/{id}/tunnels/{name}/{action}", post(server_act))
@@ -145,11 +154,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/mirage-test/stop", post(mirage_stop))
         .route("/api/ssh-key", get(ssh_key))
         .route("/api/pathfinder", post(pathfinder))
+        .route("/api/pathfinder/cancel", post(pathfinder_cancel))
         .route("/api/servers/ssh", post(ssh_add))
         .route("/api/releases", get(releases))
         .route("/api/alerts", get(alerts_list))
         .route("/api/alerts/test", post(alerts_test))
         .route("/api/settings", get(settings_get).post(settings_set))
+        .route("/api/dashboard/certificate", get(certificate_status).post(certificate_set))
         .route("/api/password", post(password_set))
         .route("/api/sessions", get(sessions_list))
         .route("/api/sessions/revoke", post(sessions_revoke))
@@ -438,10 +449,55 @@ fn error(status: StatusCode, word: &str) -> Response {
     (status, Json(json!({"error": word}))).into_response()
 }
 
+/// A failed request's answer. A failure with a code (`ops::code_of`, also from a joined server)
+/// gets its own status and word; any other keeps `otherwise` and "failed", as before. The
+/// message is always in `detail`.
+fn failure_response(failure: &anyhow::Error, otherwise: StatusCode) -> Response {
+    let (status, word) = match ops::code_of(failure) {
+        Some("unknown_tunnel") => (StatusCode::NOT_FOUND, "unknown_tunnel"),
+        Some("busy") => (StatusCode::CONFLICT, "busy"),
+        Some("pair_changed") => (StatusCode::CONFLICT, "pair_changed"),
+        Some("offline") => (StatusCode::BAD_GATEWAY, "offline"),
+        Some("timeout") => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
+        _ => (otherwise, "failed"),
+    };
+    (status, Json(json!({"error": word, "detail": format!("{failure:#}")}))).into_response()
+}
+
 /// The tunnel names that exist, read off the async threads.
 async fn tunnel_names(state: &Arc<AppState>) -> Vec<String> {
     let ops = state.ops.clone();
     tokio::task::spawn_blocking(move || ops.names()).await.unwrap_or_default()
+}
+
+/// Use a distinct action-name variant on the EXISTING URL so an older Hub
+/// also fails closed (its legacy parse_action rejects paired-start/stop/restart).
+fn action_route(word: &str) -> Option<(crate::manager::bulk::Action, bool)> {
+    if let Some(legacy) = ops::parse_action(word) {
+        return Some((legacy, false));
+    }
+    word.strip_prefix("paired-")
+        .and_then(ops::parse_action)
+        .map(|action| (action, true))
+}
+
+/// A guarded lifecycle request uses the existing action URL, with an expected pair
+/// identity checked atomically inside the target Agent (or LocalOps) store lock.
+async fn action_pair_guard(request: Request) -> Result<Option<String>, Response> {
+    let bytes = read_body(request, MAX_BODY).await?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "bad_request"))?;
+    if !body.is_object() {
+        return Err(error(StatusCode::BAD_REQUEST, "bad_request"));
+    }
+    match body.get("expect_pair") {
+        None => Ok(None),
+        Some(Value::String(pair)) if ops::valid_pair(pair) => Ok(Some(pair.to_ascii_lowercase())),
+        _ => Err(error(StatusCode::BAD_REQUEST, "invalid_pair")),
+    }
 }
 
 /// Start, stop or restart one tunnel. Answers when the action is done; after a start it also
@@ -455,11 +511,18 @@ async fn act(
         return unauthorized();
     }
     let ip = client_ip(&request);
-    let Some(action) = ops::parse_action(&action) else {
+    let Some((action, paired)) = action_route(&action) else {
         return error(StatusCode::NOT_FOUND, "unknown_action");
     };
     if !tunnel_names(&state).await.contains(&name) {
         return error(StatusCode::NOT_FOUND, "unknown_tunnel");
+    }
+    let expected_pair = match action_pair_guard(request).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if expected_pair.is_some() != paired {
+        return error(StatusCode::BAD_REQUEST, "invalid_pair");
     }
     let Some(busy) = Busy::take(&state, vec![name.clone()]) else {
         return error(StatusCode::CONFLICT, "busy");
@@ -472,7 +535,10 @@ async fn act(
     // until the action really ends.
     let task = tokio::task::spawn_blocking(move || {
         let _busy = busy;
-        ops.act(&task_name, action)
+        match expected_pair {
+            Some(pair) => ops.act_pair(&task_name, action, &pair),
+            None => ops.act(&task_name, action),
+        }
     });
     let answer = tokio::time::timeout(ACTION_TIMEOUT, task).await;
     state.live.refresh();
@@ -486,7 +552,7 @@ async fn act(
         Ok(Ok(Err(failure))) => {
             let detail = format!("{failure:#}");
             state.audit.record(ip, "action_failed", &format!("{word} {name}: {detail}"));
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            failure_response(&failure, StatusCode::INTERNAL_SERVER_ERROR)
         }
         Ok(Err(_)) => error(StatusCode::INTERNAL_SERVER_ERROR, "failed"),
         Err(_) => error(StatusCode::GATEWAY_TIMEOUT, "timeout"),
@@ -726,7 +792,65 @@ async fn servers(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         Some(fleet) => fleet.servers(),
         None => demo_servers(state.live.latest().as_deref()),
     };
-    Json(json!({"servers": list, "offline_after": super::fleet::OFFLINE_AFTER})).into_response()
+    let local_name = super::prefs::load(&state.state_dir).server_name;
+    Json(json!({"servers": list, "offline_after": super::fleet::OFFLINE_AFTER, "local_name": local_name})).into_response()
+}
+
+/// A display name typed on the dashboard: trimmed, 1..=40 characters of letters, digits, spaces
+/// and `-_.()#`. Empty means "go back to the server's own name". Anything else is refused, so a
+/// name is safe in alerts, metrics labels and the page.
+fn server_label(text: &str) -> Result<Option<String>, ()> {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let fine = text.chars().count() <= 40 && text.chars().all(|c| c.is_alphanumeric() || c == ' ' || "-_.()#".contains(c));
+    if fine { Ok(Some(text)) } else { Err(()) }
+}
+
+/// The name this server is shown under: the one set on the dashboard, else its hostname.
+fn local_name(state: &AppState, hostname: &str) -> String {
+    super::prefs::load(&state.state_dir).server_name.unwrap_or_else(|| hostname.to_string())
+}
+
+/// Renames a server on the dashboard (`local` is this server). Only the display name changes:
+/// the server's hostname, id and tunnels are not touched.
+async fn server_rename(State(state): State<Arc<AppState>>, Path(id): Path<String>, request: Request) -> Response {
+    if !state.signed_in(request.headers()) {
+        return unauthorized();
+    }
+    let ip = client_ip(&request);
+    let Ok(body) = axum::body::to_bytes(request.into_body(), 4096).await else {
+        return error(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    let Some(given) = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["name"].as_str().map(str::to_string)) else {
+        return error(StatusCode::BAD_REQUEST, "bad_request");
+    };
+    let Ok(label) = server_label(&given) else {
+        return error(StatusCode::BAD_REQUEST, "bad_name");
+    };
+    let shown = label.clone().unwrap_or_default();
+    if id == "local" {
+        let saved = super::prefs::change_and_save(&state.state_dir, |prefs| {
+            prefs.server_name = label.clone();
+            Ok(None)
+        });
+        if saved.is_err() {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "failed");
+        }
+    } else {
+        let Some(fleet) = &state.fleet else {
+            return Json(json!({"ok": true, "name": label})).into_response();
+        };
+        match fleet.rename(&id, label.clone()) {
+            Ok(true) => {}
+            Ok(false) => return error(StatusCode::NOT_FOUND, "unknown_server"),
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "failed"),
+        }
+    }
+    let detail = if shown.is_empty() { format!("{id}: back to its own name") } else { format!("{id}: {shown}") };
+    state.audit.record(ip, "server_renamed", &detail);
+    Json(json!({"ok": true, "name": label})).into_response()
 }
 
 /// A one-time join command for another server.
@@ -778,10 +902,20 @@ async fn server_act(
         return unauthorized();
     }
     let ip = client_ip(&request);
-    let Some(action) = ops::parse_action(&action) else {
+    let Some((action, paired)) = action_route(&action) else {
         return error(StatusCode::NOT_FOUND, "unknown_action");
     };
+    let expected_pair = match action_pair_guard(request).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if expected_pair.is_some() != paired {
+        return error(StatusCode::BAD_REQUEST, "invalid_pair");
+    }
     let Some(fleet) = state.fleet.clone() else {
+        if expected_pair.is_some() {
+            return error(StatusCode::BAD_GATEWAY, "remote_offline");
+        }
         tokio::time::sleep(Duration::from_millis(700)).await;
         return Json(json!({"ok": true, "changed": true, "came_up": (action != crate::manager::bulk::Action::Stop).then_some(true)})).into_response();
     };
@@ -793,14 +927,17 @@ async fn server_act(
     };
     let word = ops::action_word(action);
     state.audit.record(ip, "action", &format!("{word} {name} on {id}"));
-    let answer = fleet.request_held(&id, json!({"op": "act", "name": name, "action": word}), ACTION_TIMEOUT, busy.clone()).await;
+    let answer = fleet.request_held(&id,
+        json!({"op": if expected_pair.is_some() { "act_pair" } else { "act" },
+            "name": name, "action": word, "expect_pair": expected_pair}),
+        ACTION_TIMEOUT, busy.clone()).await;
     drop(busy);
     match answer {
         Ok(outcome) => Json(json!({"ok": true, "changed": outcome["changed"], "came_up": outcome["came_up"]})).into_response(),
         Err(failure) => {
             let detail = format!("{failure:#}");
             state.audit.record(ip, "action_failed", &format!("{word} {name} on {id}: {detail}"));
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            failure_response(&failure, StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -831,7 +968,7 @@ async fn editable_answer(state: Arc<AppState>, server: String, name: String, hea
     }
     match run_edit(&state, &server, &name, json!({"op": "editable"})).await {
         Ok(screen) => Json(screen).into_response(),
-        Err(failure) => (StatusCode::BAD_REQUEST, Json(json!({"error": "failed", "detail": format!("{failure:#}")}))).into_response(),
+        Err(failure) => failure_response(&failure, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -881,7 +1018,7 @@ async fn change_answer_owned(state: Arc<AppState>, server: String, name: String,
         Err(failure) => {
             let detail = format!("{failure:#}");
             state.audit.record(ip, "action_failed", &format!("{what} {name}{place}: {detail}"));
-            (StatusCode::BAD_REQUEST, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            failure_response(&failure, StatusCode::BAD_REQUEST)
         }
     }
 }
@@ -967,7 +1104,7 @@ async fn status_answer(state: Arc<AppState>, server: String, name: String, heade
     }
     match run_on(&state, &server, json!({"op": "status", "name": name}), Duration::from_secs(10)).await {
         Ok(status) => Json(status).into_response(),
-        Err(failure) => (StatusCode::BAD_REQUEST, Json(json!({"error": "failed", "detail": format!("{failure:#}")}))).into_response(),
+        Err(failure) => failure_response(&failure, StatusCode::BAD_REQUEST),
     }
 }
 
@@ -1038,7 +1175,7 @@ async fn tool_answer_owned(state: Arc<AppState>, server: String, name: String, o
         Err(failure) => {
             let detail = format!("{failure:#}");
             state.audit.record(ip, "action_failed", &format!("{what} {name}{place}: {detail}"));
-            (StatusCode::BAD_REQUEST, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            failure_response(&failure, StatusCode::BAD_REQUEST)
         }
     }
 }
@@ -1113,7 +1250,7 @@ async fn server_tool_answer_owned(State(state): State<Arc<AppState>>, Path((id, 
             if changes {
                 state.audit.record(ip, "action_failed", &format!("{what}{place}: {detail}"));
             }
-            (StatusCode::BAD_REQUEST, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            failure_response(&failure, StatusCode::BAD_REQUEST)
         }
     }
 }
@@ -1124,7 +1261,7 @@ fn current_problems(state: &AppState) -> Vec<super::alerts::Problem> {
     let mut found = Vec::new();
     if let Some(snapshot) = state.live.latest() {
         let value = serde_json::to_value(&*snapshot).unwrap_or_default();
-        let name = value["host"]["hostname"].as_str().unwrap_or("this server").to_string();
+        let name = local_name(state, value["host"]["hostname"].as_str().unwrap_or("this server"));
         found.extend(problems_of("local", &name, &value));
     }
     let servers = match &state.fleet {
@@ -1265,13 +1402,108 @@ async fn settings_get(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
         return unauthorized();
     }
     let prefs = super::prefs::load(&state.state_dir);
-    let cert = state.cert.as_ref().map(|c| json!({"not_after": c.not_after(), "lets_encrypt": state.state_dir.join("acme-chain.pem").exists()}));
+    let configured_certificate = super::load_settings(&state.state_dir).ok().and_then(|s| s.acme);
+    let cert = state.cert.as_ref().map(|c| json!({"not_after": c.not_after(), "lets_encrypt": configured_certificate.is_some()}));
     Json(json!({
         "prefs": super::prefs::shown(&prefs),
         "telegram_last": super::alerts::last_delivery(&state.state_dir),
-        "panel": {"address": state.public.0, "port": state.public.1, "https": state.secure, "cert": cert, "version": env!("CARGO_PKG_VERSION"), "state_dir": state.state_dir.display().to_string()},
+        "panel": {"address": state.public.0, "port": state.public.1, "https": state.secure, "cert": cert, "certificate_address": configured_certificate.map(|s| s.address), "version": env!("CARGO_PKG_VERSION"), "state_dir": state.state_dir.display().to_string()},
     }))
     .into_response()
+}
+
+/// Whether the live TLS resolver presents the certificate currently configured on disk.
+/// A manual `dashboard serve --no-service` does not restart by systemd, so a saved
+/// setting must never be mistaken for a certificate already active in this process.
+pub(super) fn certificate_is_active(state_dir: &std::path::Path, swap: Option<&super::tls::Swap>) -> Option<bool> {
+    let current = swap?.current();
+    let actual = current.cert.first()?.as_ref();
+    let configured = super::load_settings(state_dir).ok()?;
+    let expected = match configured.acme.as_ref() {
+        Some(wanted) => {
+            let issued = super::acme::load_for(state_dir, wanted)?;
+            let (_, until) = issued.validity().ok()?;
+            if until <= super::now() { return Some(false); }
+            issued.chain.first()?.as_ref().to_vec()
+        },
+        None => super::tls::self_signed_der(state_dir)?,
+    };
+    Some(actual == expected)
+}
+
+/// Configuring a domain may take several minutes (ACME HTTP-01). Keep the HTTP request
+/// short and expose progress/errors without risking a client timeout during the order.
+async fn certificate_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !state.signed_in(&headers) { return unauthorized(); }
+    let task = state.certificate_task.lock().unwrap().clone();
+    let recorded = super::activation::status(&state.state_dir);
+    let worker_running = recorded.as_ref().is_some_and(|(running, _, _)| *running);
+    let phase = recorded.as_ref().and_then(|(_, _, phase)| phase.as_deref());
+    let message = recorded.as_ref().and_then(|(_, message, _)| message.clone());
+    let error = task.error.or_else(|| match phase {
+        Some("recovered" | "recovery_failed" | "failed" | "queued" | "applying" | "restoring") if !worker_running => message.clone(),
+        _ => None,
+    });
+    let active = certificate_is_active(&state.state_dir, state.cert.as_deref());
+    let configured_address = super::load_settings(&state.state_dir).ok()
+        .and_then(|settings| settings.acme.map(|wanted| wanted.address));
+    Json(json!({
+        "running": task.running || worker_running,
+        "error": error,
+        "phase": phase,
+        "message": message,
+        "address": task.address,
+        "configured_address": configured_address,
+        "active": active == Some(true),
+        "restart_required": phase == Some("restart_required") || (active == Some(false) && !task.running && !worker_running),
+    })).into_response()
+}
+
+async fn certificate_set(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if !state.signed_in(request.headers()) { return unauthorized(); }
+    if state.demo { return failed_with(StatusCode::BAD_REQUEST, "the demo cannot change certificates"); }
+    let ip = client_ip(&request);
+    let form = match read_json(request).await {
+        Ok(form) => form,
+        Err(response) => return response,
+    };
+    let (letsencrypt, address) = match form["mode"].as_str() {
+        Some("lets_encrypt") => {
+            let Some(domain) = form["address"].as_str() else {
+                return failed_with(StatusCode::BAD_REQUEST, "enter a domain name or IP address");
+            };
+            match super::certificate_address(domain) {
+                Ok(value) => (true, Some(value)),
+                Err(error) => return failed_with(StatusCode::BAD_REQUEST, format!("{error:#}")),
+            }
+        }
+        Some("self_signed") => (false, None),
+        _ => return failed_with(StatusCode::BAD_REQUEST, "mode must be lets_encrypt or self_signed"),
+    };
+    {
+        let mut task = state.certificate_task.lock().unwrap();
+        if task.running { return failed_with(StatusCode::CONFLICT, "a certificate change is already running"); }
+        *task = CertificateTask { running: true, error: None, address: address.clone() };
+    }
+    let next_address = address.clone().unwrap_or_else(super::shown_address);
+    let url = format!("https://{}:{}", if next_address.contains(':') { format!("[{next_address}]") } else { next_address.clone() }, state.public.1);
+    state.audit.record(ip, "action", &format!("configure dashboard certificate for {next_address}"));
+    tokio::spawn(async move {
+        // ACME issuance may run in this process, but activation/restart and rollback
+        // run in a separately supervised systemd transient unit. The next server
+        // instance reads durable progress rather than trusting this in-memory task.
+        let result = super::certificate(&state.state_dir, letsencrypt, false, address).await;
+        let mut task = state.certificate_task.lock().unwrap();
+        task.running = false;
+        if let Err(error) = result {
+            let detail = format!("{error:#}");
+            state.audit.record(ip, "certificate_failed", &detail);
+            task.error = Some(detail);
+        } else {
+            state.audit.record(ip, "certificate", "certificate saved or activation dispatched; check persisted activation outcome");
+        }
+    });
+    (StatusCode::ACCEPTED, Json(json!({"started": true, "url": url}))).into_response()
 }
 
 async fn settings_set(State(state): State<Arc<AppState>>, request: Request) -> Response {
@@ -1362,7 +1594,7 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     let mut servers = Vec::new();
     if let Some(snapshot) = state.live.latest() {
         let value = serde_json::to_value(&*snapshot).unwrap_or_default();
-        let name = value["host"]["hostname"].as_str().unwrap_or("").to_string();
+        let name = local_name(&state, value["host"]["hostname"].as_str().unwrap_or(""));
         servers.push(("local".to_string(), name, value));
     }
     if let Some(fleet) = &state.fleet {
@@ -1908,6 +2140,21 @@ fn online_servers(state: &AppState) -> Vec<(String, String, String)> {
 
 /// One path search at a time: two would open their echo and relay ports on the same numbers.
 static PATH_SEARCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Cancel (`POST /api/pathfinder/cancel`) wakes the search running now.
+static PATH_CANCEL: std::sync::LazyLock<tokio::sync::Notify> = std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+/// Stops the path search that is running, if one is. Its test ports are closed on every server.
+async fn pathfinder_cancel(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !state.signed_in(&headers) {
+        return unauthorized();
+    }
+    if PATH_SEARCH.try_lock().is_ok() {
+        return Json(json!({"ok": true, "running": false})).into_response();
+    }
+    state.audit.record(None, "action", "cancel the path search");
+    PATH_CANCEL.notify_waiters();
+    Json(json!({"ok": true, "running": true})).into_response()
+}
 
 /// Finds a way between two servers: the direct path both ways, what the Iran server reaches
 /// abroad, and every other managed server tried as a relay (a temporary forwarder there, checked
@@ -1954,6 +2201,11 @@ async fn pathfinder(State(state): State<Arc<AppState>>, request: Request) -> Res
         let state = state.clone();
         async move { run_on(&state, &server, json!({"op": "server", "tool": "path", "path": step}), Duration::from_secs(40)).await.unwrap_or_else(|e| json!({"ok": false, "error": format!("{e:#}")})) }
     };
+    // Cancel may come at any step: listen for it from the start.
+    let cancelled = PATH_CANCEL.notified();
+    tokio::pin!(cancelled);
+    cancelled.as_mut().enable();
+    let scan = async {
     let mut out = serde_json::Map::new();
     out.insert("from_iran".into(), path(iran.clone(), json!({"step": "probe", "host": foreign_ip.to_string(), "ports": [ECHO]})).await);
     out.insert("known".into(), path(iran.clone(), json!({"step": "known"})).await["known"].clone());
@@ -2006,6 +2258,21 @@ async fn pathfinder(State(state): State<Arc<AppState>>, request: Request) -> Res
     out.insert("relays".into(), json!(relays));
     out.insert("foreign_asked".into(), json!(foreign_online));
     Json(Value::Object(out)).into_response()
+    };
+    tokio::select! {
+        response = scan => response,
+        () = &mut cancelled => {
+            // Whatever the search had opened goes now: the echo on each end, the relay forwarders.
+            if foreign_online {
+                path(foreign.clone(), json!({"step": "close", "port": ECHO})).await;
+            }
+            path(iran.clone(), json!({"step": "close", "port": BACK})).await;
+            for (id, _, _) in online.iter().filter(|(id, _, _)| *id != iran && *id != foreign) {
+                path(id.clone(), json!({"step": "close", "port": RELAY})).await;
+            }
+            Json(json!({"cancelled": true})).into_response()
+        }
+    }
 }
 
 /// The dashboard's public SSH key, for adding servers over SSH.
@@ -2247,28 +2514,61 @@ async fn new_tunnel_owned(State(state): State<Arc<AppState>>, request: Request) 
 }
 
 /// Deletes a tunnel here or on a joined server.
-async fn delete_answer(state: Arc<AppState>, server: String, name: String, request: Request) -> Response {
+async fn delete_answer(
+    state: Arc<AppState>,
+    server: String,
+    name: String,
+    request: Request,
+) -> Response {
     if !state.signed_in(request.headers()) {
         return unauthorized();
     }
     let ip = client_ip(&request);
+    // Optional `{"pair": ...}`: the fingerprint the tunnel was chosen by, checked on its server
+    // under the tunnel's lock. A page from before it sends no body and deletes by name.
+    let pair = match read_body(request, MAX_BODY).await {
+        Ok(bytes) if bytes.is_empty() => None,
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(body) if body.is_object() => match body.get("pair") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(pair)) if ops::valid_pair(pair) => Some(pair.to_ascii_lowercase()),
+                Some(_) => return error(StatusCode::BAD_REQUEST, "bad_pair"),
+            },
+            _ => return error(StatusCode::BAD_REQUEST, "bad_request"),
+        },
+        Err(response) => return response,
+    };
     let local = server == "local";
-    let key = if local { name.clone() } else { format!("{server}/{name}") };
+    let key = if local {
+        name.clone()
+    } else {
+        format!("{server}/{name}")
+    };
     if !local && state.busy.lock().unwrap().contains(&format!("{server}/*")) {
         return error(StatusCode::CONFLICT, "busy");
     }
     let Some(busy) = Busy::take(&state, vec![key]) else {
         return error(StatusCode::CONFLICT, "busy");
     };
-    let place = if local { String::new() } else { format!(" on {server}") };
-    state.audit.record(ip, "action", &format!("delete {name}{place}"));
+    let place = if local {
+        String::new()
+    } else {
+        format!(" on {server}")
+    };
+    state
+        .audit
+        .record(ip, "action", &format!("delete {name}{place}"));
     let answer: Result<()> = if local {
         let ops = state.ops.clone();
         let task_name = name.clone();
+        let task_pair = pair.clone();
         // The guard moves into the task, so a slow delete keeps the tunnel marked busy.
         let task = tokio::task::spawn_blocking(move || {
             let _busy = busy;
-            ops.delete(&task_name)
+            match task_pair {
+                Some(pair) => ops.delete_pair(&task_name, &pair),
+                None => ops.delete(&task_name),
+            }
         });
         match tokio::time::timeout(ACTION_TIMEOUT, task).await {
             Ok(Ok(result)) => result,
@@ -2279,7 +2579,12 @@ async fn delete_answer(state: Arc<AppState>, server: String, name: String, reque
         let Some(fleet) = state.fleet.clone() else {
             return error(StatusCode::NOT_FOUND, "unknown_server");
         };
-        let answer = fleet.request_held(&server, json!({"op": "delete", "name": name}), ACTION_TIMEOUT, busy.clone()).await.map(|_| ());
+        // Guarded removal is an explicit Agent operation: older Agents without it reject
+        // the request rather than ignore a fingerprint and delete a replacement tunnel.
+        let op = if pair.is_some() { "delete_pair" } else { "delete" };
+        let answer = fleet.request_held(&server,
+            json!({"op": op, "name": name, "expect_pair": pair}),
+            ACTION_TIMEOUT, busy.clone()).await.map(|_| ());
         drop(busy);
         answer
     };
@@ -2289,7 +2594,7 @@ async fn delete_answer(state: Arc<AppState>, server: String, name: String, reque
         Err(failure) => {
             let detail = format!("{failure:#}");
             state.audit.record(ip, "action_failed", &format!("delete {name}{place}: {detail}"));
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            failure_response(&failure, StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -2335,7 +2640,7 @@ async fn server_restart_all(State(state): State<Arc<AppState>>, Path(id): Path<S
         Err(failure) => {
             let detail = format!("{failure:#}");
             state.audit.record(ip, "action_failed", &format!("restart all on {id}: {detail}"));
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "failed", "detail": detail}))).into_response()
+            failure_response(&failure, StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -2359,7 +2664,7 @@ async fn server_logs(
         // An agent from before the cursor sends the lines alone.
         Ok(lines) if lines.is_array() => Json(json!({"lines": lines})).into_response(),
         Ok(tail) => Json(tail).into_response(),
-        Err(failure) => (StatusCode::BAD_GATEWAY, Json(json!({"error": "failed", "detail": format!("{failure:#}")}))).into_response(),
+        Err(failure) => failure_response(&failure, StatusCode::BAD_GATEWAY),
     }
 }
 
@@ -2386,7 +2691,7 @@ async fn server_follow(
     };
     match fleet.follow(&id, &name, after).await {
         Ok(follow) => sse_lines(state, token, permit, LineSource::Remote(follow)),
-        Err(failure) => (StatusCode::BAD_GATEWAY, Json(json!({"error": "failed", "detail": format!("{failure:#}")}))).into_response(),
+        Err(failure) => failure_response(&failure, StatusCode::BAD_GATEWAY),
     }
 }
 
@@ -2564,6 +2869,7 @@ mod tests {
             public: ("203.0.113.10".into(), 38_471),
             agent_slots: Arc::new(Semaphore::new(4)),
             cert: None,
+            certificate_task: Default::default(),
             demo: true,
             secure: false,
             state_dir: std::env::temp_dir().join(format!("ezd-test-{}-{:?}", std::process::id(), std::thread::current().id()).replace(['(', ')'], "")),
@@ -2646,6 +2952,107 @@ mod tests {
         let response = call(&app, with_cookie(post("/api/pathfinder", body, true), &cookie)).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
         drop(held);
+    }
+
+    /// Cancel needs a session; with no search running it says so and changes nothing.
+    #[tokio::test]
+    async fn the_path_search_can_be_cancelled() {
+        let (app, _) = app().await;
+        let cookie = signed_in(&app).await;
+        assert_eq!(call(&app, post("/api/pathfinder/cancel", "{}", true)).await.status(), StatusCode::UNAUTHORIZED);
+        let idle = json_of(call(&app, with_cookie(post("/api/pathfinder/cancel", "{}", true), &cookie)).await).await;
+        assert_eq!(idle, json!({"ok": true, "running": false}));
+        // A search that is waiting is woken by Cancel.
+        let waiting = PATH_CANCEL.notified();
+        tokio::pin!(waiting);
+        waiting.as_mut().enable();
+        PATH_CANCEL.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), waiting).await.expect("Cancel reaches the search");
+    }
+
+    /// An authenticated API on a manually served dashboard reports that persistence
+    /// alone does not activate TLS. It reports active only after the presented pair
+    /// changes, just as a stop/start of `dashboard serve --no-service` would do.
+    #[tokio::test]
+    async fn manual_dashboard_certificate_status_distinguishes_saved_from_active() {
+        let (initial, mut state) = app().await;
+        drop(initial);
+        let dir = tempfile::tempdir().unwrap();
+        let swap = Arc::new(super::super::tls::Swap::self_signed(dir.path(), "127.0.0.1").unwrap());
+        super::super::save_settings(dir.path(), &super::super::Settings {
+            version: 1, port: 33001, password_hash: "unused".into(), created: 1,
+            acme: None, acme_certificate: None,
+        }).unwrap();
+        let configure = Arc::get_mut(&mut state).unwrap();
+        configure.cert = Some(swap.clone());
+        configure.state_dir = dir.path().to_path_buf();
+        configure.demo = false;
+        configure.secure = true;
+        let app = router(state);
+        let cookie = signed_in(&app).await;
+        let status = |cookie: &String| with_cookie(hyper::Request::get("/api/dashboard/certificate").body(Body::empty()).unwrap(), cookie);
+        let before = json_of(call(&app, status(&cookie)).await).await;
+        assert_eq!((before["active"].as_bool(), before["restart_required"].as_bool()), (Some(true), Some(false)));
+
+        let rcgen::CertifiedKey { cert, key_pair } = rcgen::generate_simple_self_signed(vec!["panel.example.com".into()]).unwrap();
+        let issued = super::super::acme::Issued {
+            chain: vec![rustls::pki_types::CertificateDer::from(cert.der().as_ref().to_vec())],
+            key: rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+        };
+        let wanted = super::super::acme::AcmeSettings { address: "panel.example.com".into(), staging: false };
+        super::super::change_certificate_settings(dir.path(), Some((wanted, &issued))).unwrap();
+        let pending = json_of(call(&app, status(&cookie)).await).await;
+        assert_eq!(pending["configured_address"], "panel.example.com");
+        assert_eq!((pending["active"].as_bool(), pending["restart_required"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(swap.current().cert[0].as_ref(), super::super::tls::self_signed_der(dir.path()).unwrap(), "manual process still presents old TLS");
+
+        assert!(super::super::acme::install_stored(dir.path(), &swap).is_some());
+        let active = json_of(call(&app, status(&cookie)).await).await;
+        assert_eq!((active["active"].as_bool(), active["restart_required"].as_bool()), (Some(true), Some(false)));
+    }
+
+    /// Domain controls are not public and the demo never mutates host TLS state.
+    #[tokio::test]
+    async fn dashboard_certificate_controls_need_a_session_and_refuse_demo_changes() {
+        let (app, _) = app().await;
+        let path = "/api/dashboard/certificate";
+        let anon = call(&app, hyper::Request::get(path).body(Body::empty()).unwrap()).await;
+        assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(call(&app, post(path, r#"{"mode":"lets_encrypt","address":"test.example.com"}"#, true)).await.status(), StatusCode::UNAUTHORIZED);
+        let cookie = signed_in(&app).await;
+        let status = json_of(call(&app, with_cookie(hyper::Request::get(path).body(Body::empty()).unwrap(), &cookie)).await).await;
+        assert_eq!(status["running"], false);
+        assert_eq!(status["error"], Value::Null);
+        assert_eq!(call(&app, with_cookie(post(path, r#"{"mode":"lets_encrypt","address":"test.example.com"}"#, true), &cookie)).await.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Only safe display names are kept; empty means the server's own name again.
+    #[test]
+    fn server_names_are_checked() {
+        assert_eq!(server_label("  Tehran   game (2) "), Ok(Some("Tehran game (2)".into())));
+        assert_eq!(server_label("سرور ایران"), Ok(Some("سرور ایران".into())));
+        assert_eq!(server_label("   "), Ok(None));
+        for bad in ["<b>x</b>", "a\"b", "a\\b", "x&y", "line\u{7}", &"n".repeat(41)] {
+            assert_eq!(server_label(bad), Err(()), "{bad:?}");
+        }
+    }
+
+    /// Renaming needs a session, refuses bad names and unknown servers, and shows the new name.
+    #[tokio::test]
+    async fn this_server_can_be_renamed() {
+        let (app, _) = app().await;
+        let cookie = signed_in(&app).await;
+        let rename = |id: &str, body: &str| post(&format!("/api/servers/{id}/name"), body, true);
+        assert_eq!(call(&app, rename("local", r#"{"name":"x"}"#)).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(call(&app, with_cookie(rename("local", r#"{"name":"<x>"}"#), &cookie)).await.status(), StatusCode::BAD_REQUEST);
+        let renamed = json_of(call(&app, with_cookie(rename("local", r#"{"name":"Iran edge"}"#), &cookie)).await).await;
+        assert_eq!(renamed, json!({"ok": true, "name": "Iran edge"}));
+        let listed = json_of(call(&app, with_cookie(hyper::Request::get("/api/servers").body(Body::empty()).unwrap(), &cookie)).await).await;
+        assert_eq!(listed["local_name"], "Iran edge");
+        let cleared = json_of(call(&app, with_cookie(rename("local", r#"{"name":""}"#), &cookie)).await).await;
+        assert_eq!(cleared, json!({"ok": true, "name": null}));
+        let listed = json_of(call(&app, with_cookie(hyper::Request::get("/api/servers").body(Body::empty()).unwrap(), &cookie)).await).await;
+        assert_eq!(listed["local_name"], Value::Null);
     }
 
     #[tokio::test]
@@ -2740,6 +3147,50 @@ mod tests {
         assert!(events.iter().any(|e| e["detail"] == "delete backup-tcp"), "{events:?}");
         let unsigned = hyper::Request::delete("/api/tunnels/game-fec").header(CSRF_HEADER, "1").body(Body::empty()).unwrap();
         assert_eq!(call(&app, unsigned).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_delete_with_a_pair_spares_a_tunnel_made_again_under_its_name() {
+        let (app, state) = app().await;
+        let cookie = signed_in(&app).await;
+        let form = json!({"name": "web", "transport": "tcp", "address": "192.0.2.1", "ports": "8080"});
+        let first = super::super::wizard::build(&form).unwrap().foreign;
+        let second = super::super::wizard::build(&form).unwrap().foreign;
+        let (old, new) = (super::super::data::pair_of(&first).unwrap(), super::super::data::pair_of(&second).unwrap());
+        state.ops.create("web", &first).unwrap();
+        state.ops.delete("web").unwrap();
+        state.ops.create("web", &second).unwrap();
+        let delete = |body: &str| {
+            let request = hyper::Request::delete("/api/tunnels/web").header(CSRF_HEADER, "1").header(header::CONTENT_TYPE, "application/json");
+            with_cookie(request.body(Body::from(body.to_string())).unwrap(), &cookie)
+        };
+        let refused = call(&app, delete(&json!({"pair": old}).to_string())).await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert_eq!(json_of(refused).await["error"], "pair_changed");
+        for bad in [r#"{"pair": "zz"}"#, r#"{"pair": 5}"#, "[1]", "not json"] {
+            assert_eq!(call(&app, delete(bad)).await.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        assert!(tunnel_names(&state).await.contains(&"web".to_string()), "nothing was deleted");
+        let answer = call(&app, delete(&json!({"pair": new.to_uppercase()}).to_string())).await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert!(!tunnel_names(&state).await.contains(&"web".to_string()));
+    }
+
+    #[test]
+    fn coded_failures_get_their_own_status_and_others_keep_theirs() {
+        let cases = [
+            ("unknown_tunnel", StatusCode::NOT_FOUND),
+            ("busy", StatusCode::CONFLICT),
+            ("pair_changed", StatusCode::CONFLICT),
+            ("offline", StatusCode::BAD_GATEWAY),
+            ("timeout", StatusCode::GATEWAY_TIMEOUT),
+        ];
+        for (code, status) in cases {
+            assert_eq!(failure_response(&ops::refused(code, "words"), StatusCode::BAD_REQUEST).status(), status, "{code}");
+        }
+        let busy = anyhow::Error::from(crate::manager::store::Busy("t".into())).context("nothing was changed");
+        assert_eq!(failure_response(&busy, StatusCode::BAD_REQUEST).status(), StatusCode::CONFLICT);
+        assert_eq!(failure_response(&anyhow::anyhow!("plain"), StatusCode::BAD_REQUEST).status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -1,9 +1,15 @@
 //! Official update-file verification only. Never gates startup or peer sessions.
 use ed25519_dalek::{Signature, VerifyingKey};
 
+/// This fork fetches only its own published releases, not upstream binaries.
+pub const REPOSITORY: &str = "ach1992/EZTunnel";
 pub const TRAILER_LEN: usize = 72;
 const MAGIC: &[u8; 4] = b"EZT1";
-const RELEASE_KEYS: &[(u8, &str)] = &[(0, "ff3ecfe046d04d98521d9aa93f1b0a38b2233745dbb228d51409f32fddac05cf")];
+/// The fork's release signing key is embedded by the official build workflow.
+/// Developer builds without this variable cannot accept release updates, by design.
+/// The upstream maintainer's key is not trusted by this distribution.
+const FORK_KEY_ID: u8 = 1;
+const FORK_PUBLIC_KEY: Option<&str> = option_env!("EZTUNNEL_RELEASE_PUBLIC_KEY_HEX");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -17,8 +23,9 @@ pub fn verify_bytes(bytes: &[u8]) -> Outcome {
     if let Some(public) = TEST_KEY.with(|key| *key.borrow()) {
         return verify_with(bytes, |id| (id == 239).then_some(public));
     }
-    verify_with(bytes, |id| RELEASE_KEYS.iter().find(|(key, _)| *key == id)
-        .and_then(|(_, text)| hex::decode(text).ok()?.try_into().ok()))
+    verify_with(bytes, |id| (id == FORK_KEY_ID)
+        .then_some(FORK_PUBLIC_KEY).flatten()
+        .and_then(|text| hex::decode(text).ok()?.try_into().ok()))
 }
 
 #[cfg(test)]

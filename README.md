@@ -1,9 +1,11 @@
+> **ACh-maintained fork.** We maintain our Fleet CLI/Menu and Dashboard domain controls while the [upstream contribution](https://github.com/B3hnamR/EZTunnel/pull/2) remains under review. Fork releases, installers and program updates come exclusively from [ach1992/EZTunnel](https://github.com/ach1992/EZTunnel). See [fork maintenance](docs/fork-maintenance.md) for upstream sync, release verification and signing prerequisites. Original upstream attribution is preserved below. Do not run the upstream installer to update a fork installation.
+
 <p align="center">
-  <img src="docs/assets/banner.svg" alt="EZTunnel: encrypted tunnels, made simple" width="100%">
+  <img src="docs/assets/banner.svg?v=0.12.0" alt="EZTunnel: encrypted tunnels, made simple" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://github.com/B3hnamR/EZTunnel/releases/latest"><img src="https://img.shields.io/badge/release-v0.11.0-00afff?style=for-the-badge" alt="Release v0.11.0"></a>
+  <a href="https://github.com/ach1992/EZTunnel/releases"><img src="https://img.shields.io/badge/release-fork-00afff?style=for-the-badge" alt="Release v0.12.0"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-875fff?style=for-the-badge" alt="License: AGPL-3.0"></a>
   <img src="https://img.shields.io/badge/built_with-Rust-dea584?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust">
   <img src="https://img.shields.io/badge/Linux-x86__64%20%7C%20ARM64-0087ff?style=for-the-badge&logo=linux&logoColor=white" alt="Linux x86_64 and ARM64">
@@ -35,18 +37,20 @@ config files to write.
 - **Yours:** open source and self-hosted, with no telemetry. It only talks to the
   servers you configure.
 
-## What's new in 0.11.0
+## What's new in 0.12.0
 
-- **Game mode** sends authenticated copies of game UDP packets over multiple ports and uses the
-  first copy to arrive. Pick **GAME** for FEC-UDP. FEC-RAW has its own **Gaming / low delay**
-  profile. [Game mode guide](docs/game-mode.md)
-- **Parallax packet mode** adds error correction across multiple TCP lanes. A broken lane can
-  reconnect while the other lanes carry traffic. [Parallax guide](docs/parallax.md)
-- **IPv6** is available in tunnel setup and the dashboard Path Finder. Dashboard **Find** and
-  **Tune** checks can run over IPv4, IPv6, or both. [Transport checker guide](docs/checker.md#ipv4-and-ipv6)
-- **Find and Tune** compare transports and their settings, then let you create a tunnel from a
-  result using the settings that worked. Per-tunnel carrier settings are available in the
-  terminal and dashboard. [Dashboard guide](docs/dashboard.md)
+- **Presets** for every transport: Balanced, Many users, Gaming / low delay, Streaming / big
+  downloads and Max capacity. Apply one from the manager, the dashboard or `eztunnel preset`, and
+  see every value it changes first. [Configuration guide](docs/configuration.md)
+- **Automatic connection pool**: each tunnel opens several sessions by default and adds more
+  under load, up to `connection_pool_max`. The peer needs no change.
+- **Faster defaults**: a larger stream window, single-write XHTTP chunks and batched packet-up
+  uploads. The default `kcp.mtu` is now 1350, so update both ends of a KCP tunnel together.
+- **Dashboard**: rename servers, cancel Path Finder, filter connection-test results, safer
+  two-server deletes, clearer error causes and a compact Alerts history.
+  [Dashboard guide](docs/dashboard.md)
+
+Earlier releases are listed in the [changelog](CHANGELOG.md).
 
 ## How it works
 
@@ -72,21 +76,22 @@ carries it.
 Run this as root on **each** server:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/B3hnamR/EZTunnel/main/scripts/install-latest.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh)
 ```
 
 The installer picks the right build for your CPU (x86_64 or ARM64), checks it
-against the release's `SHA256SUMS`, and installs `/usr/local/bin/eztunnel`. It
+against the release's `SHA256SUMS`, installs `/usr/local/bin/eztunnel` and then opens the manager. It
 never starts, stops or changes existing tunnels.
 
 <details>
 <summary><b>Prefer to read the installer first, or pin a version?</b></summary>
 
 ```bash
-curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/B3hnamR/EZTunnel/main/scripts/install-latest.sh
+curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh
 less install-eztunnel.sh
 sudo bash install-eztunnel.sh                      # latest release
-sudo bash install-eztunnel.sh --version v0.11.0    # a specific release
+sudo bash install-eztunnel.sh --version v0.12.0    # a specific release
+sudo bash install-eztunnel.sh --no-menu            # install only, do not open the manager
 ```
 
 **Requirements:** Linux, Bash, `curl`, `tar`, coreutils and `flock` (from
@@ -499,13 +504,14 @@ over SSH. From there you can:
 - get alerts in the dashboard and on Telegram.
 
 It runs as its own service over HTTPS with a random port and password, and tunnels never depend on
-it. See [the dashboard guide](docs/dashboard.md).
+it. See [the dashboard guide](docs/dashboard.md), including the current central Web/Menu/CLI
+feature-parity matrix, JSON automation examples, and partial-failure recovery rules.
 
 ## Managing tunnels
 
 | In the manager | What you can do |
 |---|---|
-| **Manage tunnels** | Live status, traffic, latency, reconnects, logs, start/stop/restart, ports, settings, speed tests, delete |
+| **Manage tunnels** | Live status, traffic, latency, reconnects, logs, start/stop/restart, ports, settings, presets, speed tests, delete |
 | **All tunnels** | Start, stop or change settings on many tunnels at once |
 | **Tools → Web dashboard** | Set up, run and manage the optional browser dashboard, or join this server to one |
 | **Tools → Transport checker** | Test which transports work between your servers, then create a tunnel |
@@ -560,7 +566,7 @@ Coming next to EZTunnel:
 | **Seamless failover** | Give a tunnel backup routes: another transport, or another foreign server. If the main route fails or slows down, traffic moves to a backup automatically and returns when the main route recovers. The user port never changes, open connections pause for a moment and continue instead of dropping, and game traffic keeps its session. |
 | **Three new anti-censorship transports** | New carriers built to get through heavy filtering where today's transports are blocked or throttled. |
 
-Planned features may change before they ship. Follow the [releases](https://github.com/B3hnamR/EZTunnel/releases) to see them land.
+Planned features may change before they ship. Follow the [fork releases](https://github.com/ach1992/EZTunnel/releases) to see them land.
 
 ## Using JSON instead of the menu
 
@@ -630,18 +636,6 @@ namespaces or VMs. Full details: [build from source](docs/build-from-source.md) 
 | [Transport extensions](docs/transport-upgrade.md) | [Build from source](docs/build-from-source.md) |
 | [Web dashboard](docs/dashboard.md) | [Parallax](docs/parallax.md) |
 | [Game mode](docs/game-mode.md) | |
-
-## Release quality
-
-**v0.11.0** passed 757 tests on each architecture (x86_64 and native ARM64), along with the kernel
-and Mirage runtime checks on both. Live IPv6-only checks held TCP and FEC-UDP for 60 seconds in
-both directions without a failed ping or reconnect. Both release binaries are static musl
-builds from the same source.
-
-Release binaries are signed with the official update key. Use **Tools → Update**, `eztunnel update`,
-or the dashboard's **Update** or **Install** to update a signed installation. If your installed binary
-is unsigned, use the installer first. Signed upgrade from 0.10.0 to 0.11.0 and rollback were verified
-on x86_64, and a fresh signed install was verified on ARM64.
 
 ## License
 

@@ -1,6 +1,6 @@
 [package]
 name = "eztunnel"
-version = "0.11.0"
+version = "0.12.0-ach.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Independent encrypted reverse tunnel with locally pinned peer keys"
@@ -13,7 +13,7 @@ default = ["browser-tls", "dashboard"]
 browser-tls = ["dep:boring", "dep:tokio-boring", "dep:p256", "dep:brotli-decompressor"]
 # The web dashboard (`eztunnel dashboard`): HTTPS server, sign-in, the built-in UI files and a
 # Let's Encrypt certificate for its address.
-dashboard = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:argon2", "dep:instant-acme", "dep:bytes", "dep:http", "dep:http-body-util"]
+dashboard = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower-service", "dep:argon2", "dep:instant-acme", "dep:bytes", "dep:http", "dep:http-body-util", "dep:x509-parser"]
 
 [dependencies]
 anyhow = "1"
@@ -25,7 +25,7 @@ base64 = "0.22"
 blake2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 console = "0.16"
-dialoguer = { version = "0.12", default-features = false }
+dialoguer = { version = "0.12", default-features = false, features = ["password"] }
 hex = "0.4"
 futures-util = { version = "0.3", features = ["sink"] }
 rcgen = "0.13"
@@ -43,6 +43,7 @@ hmac = "0.12"
 zeroize = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+semver = "1"
 snow = { version = "0.10", default-features = false, features = ["use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom", "risky-raw-split"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -54,6 +55,7 @@ argon2 = { version = "0.5", optional = true, default-features = false, features 
 # ACME client for the dashboard certificate. Its HTTP client is ours (hyper + tokio-rustls with
 # the bundled roots), so only the signing backend is enabled.
 instant-acme = { version = "0.8.5", optional = true, default-features = false, features = ["ring"] }
+x509-parser = { version = "0.18.1", optional = true }
 bytes = { version = "1", optional = true }
 http = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
