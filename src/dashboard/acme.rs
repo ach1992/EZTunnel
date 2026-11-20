@@ -423,16 +423,40 @@ pub async fn keep_renewed(
     let mut wait_after_failure = RETRY_FIRST;
     loop {
         if super::now() >= renew_at {
+            // A retired Dashboard process must not keep issuing for a domain
+            // that the operator has replaced. A pending activation defers the
+            // order rather than consuming ACME rate limits for a doomed write.
+            match super::load_settings(&state_dir) {
+                Ok(current) if current.acme.as_ref() != Some(&settings) => return,
+                Err(error) => {
+                    report(Err(format!("read current certificate target before renewal: {error:#}")));
+                    renew_at = super::now() + RETRY_FIRST.as_secs();
+                    tokio::time::sleep(RETRY_FIRST).await;
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            match super::activation::renewal_available(&state_dir, &settings) {
+                Ok(false) => {
+                    renew_at = super::now() + RETRY_FIRST.as_secs();
+                    tokio::time::sleep(RETRY_FIRST).await;
+                    continue;
+                }
+                Err(error) => {
+                    report(Err(format!("check certificate activation before renewal: {error:#}")));
+                    renew_at = super::now() + RETRY_FIRST.as_secs();
+                    tokio::time::sleep(RETRY_FIRST).await;
+                    continue;
+                }
+                Ok(true) => {}
+            }
             match issue(&state_dir, &settings, 80).await.and_then(|issued| {
                 let next = issued.renew_at()?;
-                let bundle = SavedCertificate::from_issued(&settings, &issued)?;
-                // Another CLI process may have chosen a different domain during issuance.
-                // Never publish that obsolete renewal or overwrite its configuration.
-                super::update_settings(&state_dir, |current| {
-                    ensure!(current.acme.as_ref() == Some(&settings), "dashboard certificate target changed while renewing");
-                    current.acme_certificate = Some(bundle);
-                    Ok(())
-                })?;
+                // Recheck under the same short-lived cross-process lock used by
+                // activation admission and commit. A newly queued activation
+                // retains the old valid certificate; no stale renewal can land.
+                ensure!(super::activation::publish_renewal(&state_dir, &settings, &issued)?,
+                    "certificate activation in progress; defer publishing renewal");
                 swap.set(tls::certified(issued.chain, PrivateKeyDer::Pkcs8(issued.key))?);
                 Ok(next)
             }) {

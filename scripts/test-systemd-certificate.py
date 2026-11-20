@@ -8,6 +8,7 @@ request ACME/production DNS or touch agents, tunnels or host networking.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import http.client
 import re
@@ -137,6 +138,39 @@ def request_self_signed_in_browser_api(port: int, password: str):
     assert changed_status == 202, f"certificate HTTP API rejected request: {changed_status} {body[:100]!r}"
 
 
+def concurrent_certificate_cli_requests(binary: Path, port: int, self_signed_der: bytes):
+    """Two *different OS processes* must never own one activation journal."""
+    until("previous transient worker collection",
+          lambda: system("is-active", "--quiet", WORKER, check=False).returncode != 0,
+          seconds=20)
+    # Hold admission until both independent CLI processes have started.
+    lock_path = STATE / "certificate-activation.lock"
+    with open(lock_path, "a+b") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        argv = [str(binary), "dashboard", "certificate", "--self-signed", "--state-dir", str(STATE)]
+        first = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        second = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(0.5)
+        fcntl.flock(held, fcntl.LOCK_UN)
+        first_out, first_err = first.communicate(timeout=25)
+        second_out, second_err = second.communicate(timeout=25)
+    values = sorted([first.returncode, second.returncode])
+    assert values == [0, 1], (
+        f"expect exactly one accepted admission, got {values}: "
+        f"first={first_out} {first_err}; second={second_out} {second_err}"
+    )
+    refused = first_err if first.returncode else second_err
+    assert "another certificate activation owns the transaction" in refused, refused
+    until("single accepted activation reaches live HTTPS and terminal journal",
+          lambda: check_service_live(self_signed_der) and phase("active"), seconds=65)
+    tx = json.loads((STATE / "certificate-activation.json").read_text())
+    assert tx["previous"] is None and tx["requested"] is None, "successful journal must be terminal"
+    journal = STATE / "certificate-activation.json"
+    assert journal.stat().st_mode & 0o777 == 0o600
+    assert not (STATE / "certificate-activation.tmp").exists()
+    print("CONCURRENT_INTERPROCESS_ADMISSION_OK accepted=1 refused=1 private_journal=600", flush=True)
+
+
 def pid():
     return int(system("show", "eztunnel-dashboard.service", "--property=MainPID",
                       "--value").stdout.strip())
@@ -177,6 +211,7 @@ def main(binary: Path):
             "  echo 'intentional test-only replacement startup failure' >&2\n"
             "  exit 66\n"
             "fi\n"
+            f"if [ -f '{STATE}/slow-start' ]; then sleep 3; fi\n"
             f"exec '{binary}' dashboard serve --state-dir '{STATE}'\n"
         )
         WRAPPER.chmod(0o755)
@@ -264,6 +299,19 @@ def main(binary: Path):
         until("operator recovery restores previous HTTPS identity",
               lambda: check_service_live(old_cert), seconds=30)
         print("INTERRUPTED_WORKER_MANUAL_RECOVERY_OK", flush=True)
+
+        # Independently exercise the two-process admission race at the end of
+        # acceptance: the earlier failed-startup scenario has aged out of
+        # systemd's default restart rate window. No product limits are changed.
+        transaction({"acme": None, "certificate": None}, first)
+        activate(binary)
+        until("certificate ready before independent CLI race",
+              lambda: check_service_live(first_der) and phase("active"), seconds=65)
+        (STATE / "slow-start").touch()
+        try:
+            concurrent_certificate_cli_requests(binary, port, old_cert)
+        finally:
+            (STATE / "slow-start").unlink(missing_ok=True)
         print("SYSTEMD_CERTIFICATE_ACCEPTANCE_PASS", flush=True)
     finally:
         # Never tear down the test Dashboard service while an independent worker
