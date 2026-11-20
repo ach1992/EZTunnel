@@ -1436,16 +1436,26 @@ pub(super) fn certificate_is_active(state_dir: &std::path::Path, swap: Option<&s
 async fn certificate_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if !state.signed_in(&headers) { return unauthorized(); }
     let task = state.certificate_task.lock().unwrap().clone();
+    let recorded = super::activation::status(&state.state_dir);
+    let worker_running = recorded.as_ref().is_some_and(|(running, _, _)| *running);
+    let phase = recorded.as_ref().and_then(|(_, _, phase)| phase.as_deref());
+    let message = recorded.as_ref().and_then(|(_, message, _)| message.clone());
+    let error = task.error.or_else(|| match phase {
+        Some("recovered" | "recovery_failed" | "failed" | "queued" | "applying" | "restoring") if !worker_running => message.clone(),
+        _ => None,
+    });
     let active = certificate_is_active(&state.state_dir, state.cert.as_deref());
     let configured_address = super::load_settings(&state.state_dir).ok()
         .and_then(|settings| settings.acme.map(|wanted| wanted.address));
     Json(json!({
-        "running": task.running,
-        "error": task.error,
+        "running": task.running || worker_running,
+        "error": error,
+        "phase": phase,
+        "message": message,
         "address": task.address,
         "configured_address": configured_address,
         "active": active == Some(true),
-        "restart_required": active == Some(false) && !task.running,
+        "restart_required": phase == Some("restart_required") || (active == Some(false) && !task.running && !worker_running),
     })).into_response()
 }
 
@@ -1479,8 +1489,9 @@ async fn certificate_set(State(state): State<Arc<AppState>>, request: Request) -
     let url = format!("https://{}:{}", if next_address.contains(':') { format!("[{next_address}]") } else { next_address.clone() }, state.public.1);
     state.audit.record(ip, "action", &format!("configure dashboard certificate for {next_address}"));
     tokio::spawn(async move {
-        // Reuse the CLI ACME/renewal/settings path. On success it restarts the dashboard,
-        // so this task and the browser's old TLS connection may disappear.
+        // ACME issuance may run in this process, but activation/restart and rollback
+        // run in a separately supervised systemd transient unit. The next server
+        // instance reads durable progress rather than trusting this in-memory task.
         let result = super::certificate(&state.state_dir, letsencrypt, false, address).await;
         let mut task = state.certificate_task.lock().unwrap();
         task.running = false;
@@ -1489,7 +1500,7 @@ async fn certificate_set(State(state): State<Arc<AppState>>, request: Request) -
             state.audit.record(ip, "certificate_failed", &detail);
             task.error = Some(detail);
         } else {
-            state.audit.record(ip, "certificate", "certificate changed; reload the dashboard");
+            state.audit.record(ip, "certificate", "certificate saved or activation dispatched; check persisted activation outcome");
         }
     });
     (StatusCode::ACCEPTED, Json(json!({"started": true, "url": url}))).into_response()

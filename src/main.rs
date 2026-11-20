@@ -368,6 +368,17 @@ enum DashboardCommand {
         #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
         state_dir: PathBuf,
     },
+    /// Restore the previous certificate selection after an interrupted activation.
+    RecoverCertificate {
+        #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
+    },
+    /// Internal systemd worker; not a user-facing command.
+    #[command(hide = true)]
+    CertificateActivationWorker {
+        #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
+        state_dir: PathBuf,
+    },
     /// Replace the password with a new random one, shown once.
     ResetPassword {
         #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
@@ -816,6 +827,8 @@ async fn run(cli: Cli) -> Result<()> {
                 DashboardCommand::Certificate { lets_encrypt, self_signed: _, address, staging, state_dir } => {
                     eztunnel::dashboard::certificate(&state_dir, lets_encrypt, staging, address).await?
                 }
+                DashboardCommand::RecoverCertificate { state_dir } => eztunnel::dashboard::recover_certificate(&state_dir).await?,
+                DashboardCommand::CertificateActivationWorker { state_dir } => eztunnel::dashboard::activate_certificate_worker(&state_dir).await?,
                 DashboardCommand::ResetPassword { state_dir } => eztunnel::dashboard::reset_password(&state_dir)?,
                 DashboardCommand::Demo { port, empty } => eztunnel::dashboard::demo(port, empty).await?,
             },

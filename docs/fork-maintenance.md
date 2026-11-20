@@ -55,6 +55,30 @@ The installer keeps a backup of an existing executable and does not restart tunn
 
 Dashboard **Settings > Dashboard access** accepts a DNS hostname or IP without scheme/port and requests a Let's Encrypt certificate using the existing HTTP-01 issuing/renewal implementation. An issued certificate, its key and the configured address are stored as **one atomic, owner-private settings update**; a failed change leaves the previous working pair intact. Previously stored legacy certificate files can still be loaded when their actual SAN and key match the configured address. DNS must resolve to this host and **port 80** must be publicly reachable for issuing and renewing; the Dashboard's HTTPS port remains unchanged. With a running systemd Dashboard service, a successful certificate change requests a restart; with `dashboard setup --no-service` plus a manually executed `dashboard serve` process, the Settings API reports **restart_required** until the process is restarted with the saved certificate. The new certificate is called **active** only after the live TLS resolver presents the committed chain; the browser may need to sign in at the new hostname. Existing paired agents keep their stored Noise identity and configured connection addresses; do not silently rewrite their enrollment. The self-signed fallback remains available.
 
+### Systemd certificate activation recovery
+
+A Dashboard process cannot safely be responsible for its own restart rollback:
+`systemctl restart eztunnel-dashboard.service` terminates the calling service cgroup.
+The certificate API/CLI therefore issues and validates the certificate first, persists a
+private activation transaction retaining the previous selection, and dispatches an independent
+transient `systemd-run` worker. This worker commits a complete key/chain/domain tuple,
+restarts the Dashboard and checks **both** the exact TLS certificate and the live
+`/api/session` response. If startup fails, it restores the previous tuple, resets a failed
+systemd service if necessary, restarts it again and verifies HTTPS before recording recovery.
+An unexpected worker interruption leaves the private transaction and the operator command
+`eztunnel dashboard recover-certificate --state-dir PATH`; `eztunnel dashboard status`
+reports the recoverable state. Inactive/no-service installations are explicitly
+`restart_required`, not falsely successful.
+
+The end-to-end regression is `scripts/test-systemd-certificate.py`. It requires an **explicitly
+marked disposable systemd container** and never runs against a host accidentally; the runner
+sets `/run/eztunnel-r1r-test-container`, uses a private test-only Dashboard service and
+simulates a replacement process that exits before accepting HTTPS. It validates successful
+activation from the authenticated Dashboard API, real previous-process termination, the
+presented TLS leaf, automatic rollback after startup failure, inactive-service handling and
+manual recovery from an interrupted worker. It neither orders real ACME certificates nor
+changes Production or Agent/tunnel units.
+
 ## Local Fleet CLI endpoint selection
 
 Fleet CLI first authenticates the locally saved TLS certificate, then uses the same

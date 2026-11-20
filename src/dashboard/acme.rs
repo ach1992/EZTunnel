@@ -116,7 +116,7 @@ impl SavedCertificate {
 
 /// Validates both halves as a usable TLS key pair and the certificate SAN identity.
 /// This is needed even when reloading older pre-bundle certificate files.
-fn validate_for(issued: &Issued, wanted: &AcmeSettings) -> Result<()> {
+pub(super) fn validate_for(issued: &Issued, wanted: &AcmeSettings) -> Result<()> {
     let certified = tls::certified(issued.chain.clone(), PrivateKeyDer::Pkcs8(issued.key.clone_key()))?;
     certified.keys_match().context("certificate and private key do not match")?;
     let leaf = issued.chain.first().context("empty certificate chain")?;

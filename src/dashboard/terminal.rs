@@ -164,6 +164,47 @@ impl ServerCertVerifier for LocalCertificate {
     }
 }
 
+/// Application-level readiness used by the independent certificate activation worker.
+/// A systemd Type=simple start alone is not evidence the new HTTPS endpoint serves
+/// the requested certificate. Validate the exact chain leaf and a real API response.
+pub(super) async fn probe_https(port: u16, expected_leaf: &[u8]) -> AnyResult<()> {
+    use anyhow::{Context, bail, ensure};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(LocalCertificate {
+            digests: vec![Sha256::digest(expected_leaf).into()],
+            provider,
+        }))
+        .with_no_client_auth();
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let addresses = local_dashboard_addresses();
+    let mut failures = Vec::new();
+    for ip in &addresses {
+        let endpoint = SocketAddr::new(*ip, port);
+        let result = tokio::time::timeout(Duration::from_secs(4), async {
+            let tcp = TcpStream::connect(endpoint).await.context("connect to Dashboard")?;
+            let name = ServerName::try_from("localhost".to_string())?;
+            let mut stream = tls.connect(name, tcp).await.context("handshake with expected Dashboard certificate")?;
+            stream.write_all(b"GET /api/session HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await?;
+            let mut reply = Vec::new();
+            stream.take(4096).read_to_end(&mut reply).await.context("read Dashboard session response")?;
+            let response = String::from_utf8_lossy(&reply);
+            ensure!(response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"), "Dashboard session endpoint returned a non-success HTTP status");
+            ensure!(response.contains("signed_in"), "Dashboard did not serve its expected session API");
+            Ok::<(), anyhow::Error>(())
+        }).await;
+        match result {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => failures.push(format!("{endpoint}: {error:#}")),
+            Err(_) => failures.push(format!("{endpoint}: HTTPS readiness timed out")),
+        }
+    }
+    bail!("no local Dashboard endpoint accepted the expected TLS certificate and session API ({} address(es) tested): {}", addresses.len(), failures.join("; "))
+}
+
 fn local_certificate_pins(state_dir: &Path) -> Result<Vec<[u8; 32]>> {
     let mut digests = Vec::new();
     if let Ok(der) = std::fs::read(state_dir.join("cert.der")) {
@@ -193,7 +234,7 @@ fn local_certificate_pins(state_dir: &Path) -> Result<Vec<[u8; 32]>> {
 /// Candidate addresses are only assigned to this host. Try loopback first (wildcard
 /// listening works there), then other interfaces for an explicit `--listen ADDRESS`.
 /// A user can also specify an exact address for unusual bindings.
-fn local_dashboard_addresses() -> Vec<IpAddr> {
+pub(super) fn local_dashboard_addresses() -> Vec<IpAddr> {
     let mut addresses = vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)];
     let mut extra = Vec::new();
     #[cfg(target_os = "linux")]
@@ -2036,6 +2077,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(ready, "Dashboard listener must be ready on {addr}");
+        if explicit.is_none() {
+            let pinned_leaf = std::fs::read(dir.path().join("cert.der")).unwrap();
+            probe_https(port, &pinned_leaf).await.expect("independent certificate worker can verify HTTPS on this local bind");
+        }
         let mut client = FleetClient::connect_password_at(dir.path(), "pw", explicit).await.unwrap();
         let authenticated = client.api(Method::GET, "/api/session").await.unwrap();
         assert_eq!(authenticated["signed_in"], true);

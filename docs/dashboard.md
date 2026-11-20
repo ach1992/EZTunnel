@@ -263,7 +263,12 @@ enter the domain or IP (without `https://` or a port), then select **Get certifi
 immediately confirms the request and shows its progress or detailed failure. The certificate,
 private key and selected address are stored together in one atomic settings update, so a failed
 attempt leaves the previously working configuration intact. With the installed systemd service,
-successful issuance restarts the dashboard. With `dashboard setup --no-service` and a manual
+the certificate request starts an **independent transient systemd activation worker** outside the
+Dashboard's service cgroup. That worker restarts the Dashboard, connects to its live HTTPS endpoint
+and verifies the exact presented certificate and Dashboard API response before marking the change
+active. If the replacement fails to start, the worker restores the previous certificate/address
+and restarts the Dashboard again; a recoverable outcome is recorded in the private Dashboard
+state directory. A stopped service is never considered activated. With `dashboard setup --no-service` and a manual
 `dashboard serve`, the Settings page explicitly reports **restart required**; issuing a
 certificate alone does not activate it. After restart, open the new `https://domain:port`
 address (the port
@@ -280,7 +285,17 @@ checks over **port 80 HTTP-01**, so that port must be free and publicly reachabl
 and renewal. The dashboard's existing HTTPS port must remain reachable, too. Renewal is automatic.
 For a CDN/proxy domain, ensure the HTTP-01 challenge reaches this host rather than a cached or
 intercepted route. The **Use self-signed** button (or CLI `--self-signed`) restores the old mode and
-restarts the dashboard; browsers can show a certificate warning in that mode.
+restarts the dashboard through the same verified activation workflow; browsers can show a certificate
+warning in that mode.
+
+If an unexpected interruption kills even the independent activation worker, the previous
+configuration remains available in `certificate-activation.json`. Run `sudo eztunnel dashboard
+status` for the last activation result. To restore it manually without overwriting unrelated
+settings, run `sudo eztunnel dashboard recover-certificate` (or add `--state-dir PATH`).
+Inspect `journalctl -u eztunnel-dashboard-certificate-activation.service` and
+`journalctl -u eztunnel-dashboard.service` for exact failure details. An inactive systemd
+Dashboard or a manual `dashboard serve` instance stores a pending-restart selection rather than
+reporting successful activation; start/restart the service explicitly and verify its HTTPS endpoint.
 
 ## Managing the dashboard
 

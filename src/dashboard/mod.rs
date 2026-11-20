@@ -4,6 +4,7 @@
 //! once, a self-signed certificate); `eztunnel dashboard serve` runs the server; `eztunnel
 //! dashboard demo` serves the same interface with sample data on the loopback address only.
 mod acme;
+mod activation;
 mod agent;
 mod alerts;
 mod assets;
@@ -387,6 +388,10 @@ pub fn status(state_dir: &Path) -> Result<()> {
         println!("Dashboard:    {state}");
         println!("Address:      {}", s.url);
         println!("Certificate:  {}", s.certificate);
+        if let Some((worker_running, detail, phase)) = activation::status(state_dir) {
+            println!("Activation:   {}{}", phase.as_deref().unwrap_or("unknown"), if worker_running { " (in progress)" } else { "" });
+            if let Some(detail) = detail { println!("Activation detail: {detail}"); }
+        }
     } else {
         println!("Dashboard:    not set up on this server");
     }
@@ -488,13 +493,13 @@ fn change_certificate_settings(state_dir: &Path, next: Option<(acme::AcmeSetting
     })
 }
 
-/// Issue first without modifying any active key or certificate, then atomically commit
-/// the matching certificate/key/domain as a single settings document. On service restart
-/// failure, restore the previous selection and attempt to bring it back online.
+/// Issue and validate a new certificate before modifying any live Dashboard settings.
+/// A systemd-managed Dashboard uses a separately supervised activation worker so
+/// restarting it can never kill the only code able to restore its old certificate.
 pub async fn certificate(state_dir: &Path, lets_encrypt: bool, staging: bool, address: Option<String>) -> Result<()> {
     require_root()?;
     load_settings(state_dir)?;
-    let next = if lets_encrypt {
+    let selected = if lets_encrypt {
         let address = certificate_address(&address.unwrap_or_else(shown_address))?;
         ensure!(address != "SERVER-IP", "this server's address was not found; give it with --address");
         let wanted = acme::AcmeSettings { address: address.clone(), staging };
@@ -504,32 +509,27 @@ pub async fn certificate(state_dir: &Path, lets_encrypt: bool, staging: bool, ad
         let (_, until) = issued.validity()?;
         let kind = if staging { " (staging, not trusted by browsers)" } else { "" };
         println!("Certificate ready{kind}, valid until {}.", acme::utc_text(until));
-        Some((wanted, issued))
+        activation::Selection {
+            certificate: Some(acme::SavedCertificate::from_issued(&wanted, &issued)?),
+            acme: Some(wanted),
+        }
     } else {
-        None
+        activation::Selection { acme: None, certificate: None }
     };
-    let selected = next.as_ref().map(|(wanted, _)| wanted.clone());
-    let old = change_certificate_settings(state_dir, next.as_ref().map(|(wanted, issued)| (wanted.clone(), issued)))?;
-    let text = if lets_encrypt { "the new certificate" } else { "the self-signed certificate" };
-    if let Err(failure) = service::apply(text) {
-        let rolled_back = update_settings(state_dir, |settings| {
-            ensure!(settings.acme == selected, "dashboard certificate settings changed concurrently; cannot roll back an unrelated change");
-            (settings.acme, settings.acme_certificate) = old;
-            Ok(())
-        });
-        return match rolled_back {
-            Ok(()) => {
-                let restarted = service::apply("the previous certificate");
-                Err(failure.context(match restarted {
-                    Ok(()) => "dashboard restart failed; previous certificate configuration was restored".to_string(),
-                    Err(error) => format!("dashboard restart failed; previous configuration restored but restarting it also failed: {error:#}"),
-                }))
-            }
-            Err(error) => Err(failure.context(format!("dashboard restart failed and previous settings could not be restored: {error:#}"))),
-        };
-    }
-    println!("The dashboard renews its Let's Encrypt certificate automatically when configured.");
+    activation::schedule(state_dir, selected)?;
+    println!("Certificate change requested. An active systemd Dashboard is restarted and HTTPS-verified by a separate recovery worker; check Dashboard Settings or journalctl for the final result.");
     Ok(())
+}
+
+/// If the activation worker itself is unexpectedly terminated, restore the
+/// previous verified selection without overwriting any unrelated newer settings.
+pub async fn recover_certificate(state_dir: &Path) -> Result<()> {
+    activation::recover(state_dir).await
+}
+
+/// Internal transient-systemd-unit entry point; never run inside the Dashboard service.
+pub async fn activate_certificate_worker(state_dir: &Path) -> Result<()> {
+    activation::run(state_dir).await
 }
 
 /// Serves the interface with sample data on the loopback address, over plain HTTP. Nothing on
