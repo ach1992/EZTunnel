@@ -88,6 +88,8 @@ export const restoreBackup = (server, body) => call("POST", `/api/servers/${enco
 export const getAlerts = () => call("GET", "/api/alerts");
 export const getSettings = () => call("GET", "/api/settings");
 export const saveSettings = (body) => call("POST", "/api/settings", body);
+export const certificateStatus = () => call("GET", "/api/dashboard/certificate");
+export const changeCertificate = (body) => call("POST", "/api/dashboard/certificate", body);
 export const setPassword = (current, next) => call("POST", "/api/password", { current, new: next }, 30_000);
 export const getSessions = () => call("GET", "/api/sessions");
 export const revokeSession = (id) => call("POST", "/api/sessions/revoke", { id });

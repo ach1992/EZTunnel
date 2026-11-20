@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.12.0-ach.1 (fork candidate, unreleased)
+
+- Fork based on upstream 0.12.0 including the Fleet CLI/Menu contribution in upstream PR #2.
+- Dashboard Settings: configure domain or IP for Let's Encrypt, see progress/errors, restore self-signed certificate.
+- Fork-owned release sources and signing public key, with safe sync PR and explicit release workflows.
+- Update ordering respects fork-specific prerelease suffixes.
+
 ## 0.12.0 (2026-11-20)
 
 - Added **presets** for every transport: **Balanced** (recommended), **Many users**,

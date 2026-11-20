@@ -1,9 +1,11 @@
+> **ACh-maintained fork.** We maintain our Fleet CLI/Menu and Dashboard domain controls while the [upstream contribution](https://github.com/B3hnamR/EZTunnel/pull/2) remains under review. Fork releases, installers and program updates come exclusively from [ach1992/EZTunnel](https://github.com/ach1992/EZTunnel). See [fork maintenance](docs/fork-maintenance.md) for upstream sync, release verification and signing prerequisites. Original upstream attribution is preserved below. Do not run the upstream installer to update a fork installation.
+
 <p align="center">
   <img src="docs/assets/banner.svg?v=0.12.0" alt="EZTunnel: encrypted tunnels, made simple" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://github.com/B3hnamR/EZTunnel/releases/latest"><img src="https://img.shields.io/badge/release-v0.12.0-00afff?style=for-the-badge" alt="Release v0.12.0"></a>
+  <a href="https://github.com/ach1992/EZTunnel/releases"><img src="https://img.shields.io/badge/release-fork-00afff?style=for-the-badge" alt="Release v0.12.0"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-875fff?style=for-the-badge" alt="License: AGPL-3.0"></a>
   <img src="https://img.shields.io/badge/built_with-Rust-dea584?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust">
   <img src="https://img.shields.io/badge/Linux-x86__64%20%7C%20ARM64-0087ff?style=for-the-badge&logo=linux&logoColor=white" alt="Linux x86_64 and ARM64">
@@ -74,7 +76,7 @@ carries it.
 Run this as root on **each** server:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/B3hnamR/EZTunnel/main/scripts/install-latest.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh)
 ```
 
 The installer picks the right build for your CPU (x86_64 or ARM64), checks it
@@ -85,7 +87,7 @@ never starts, stops or changes existing tunnels.
 <summary><b>Prefer to read the installer first, or pin a version?</b></summary>
 
 ```bash
-curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/B3hnamR/EZTunnel/main/scripts/install-latest.sh
+curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh
 less install-eztunnel.sh
 sudo bash install-eztunnel.sh                      # latest release
 sudo bash install-eztunnel.sh --version v0.12.0    # a specific release
@@ -564,7 +566,7 @@ Coming next to EZTunnel:
 | **Seamless failover** | Give a tunnel backup routes: another transport, or another foreign server. If the main route fails or slows down, traffic moves to a backup automatically and returns when the main route recovers. The user port never changes, open connections pause for a moment and continue instead of dropping, and game traffic keeps its session. |
 | **Three new anti-censorship transports** | New carriers built to get through heavy filtering where today's transports are blocked or throttled. |
 
-Planned features may change before they ship. Follow the [releases](https://github.com/B3hnamR/EZTunnel/releases) to see them land.
+Planned features may change before they ship. Follow the [fork releases](https://github.com/ach1992/EZTunnel/releases) to see them land.
 
 ## Using JSON instead of the menu
 

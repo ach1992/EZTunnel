@@ -288,6 +288,25 @@ pub fn remove(state_dir: &Path, delete_data: bool) -> Result<()> {
 /// The dashboard's system service.
 pub const DASHBOARD_UNIT: &str = service::UNIT;
 
+/// Accept a DNS name (including punycode) or an IP for the existing ACME HTTP-01 flow.
+/// Reject URL schemes, ports and paths: the dashboard port stays unchanged.
+pub(crate) fn certificate_address(text: &str) -> Result<String> {
+    let value = text.trim().trim_end_matches('.');
+    ensure!(!value.is_empty(), "enter a domain name or IP address");
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Ok(ip.to_string());
+    }
+    ensure!(value.len() <= 253 && value.is_ascii(), "use a DNS hostname (international names must use their punycode form)");
+    let names: Vec<&str> = value.split('.').collect();
+    ensure!(names.len() >= 2 && names.iter().all(|part| {
+        !part.is_empty() && part.len() <= 63 &&
+        !part.starts_with('-') && !part.ends_with('-') &&
+        part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }), "enter a valid domain name without a scheme, port or path");
+    ensure!(names.last().is_some_and(|last| last.bytes().any(|b| b.is_ascii_alphabetic())), "the domain must have a DNS suffix");
+    Ok(value.to_ascii_lowercase())
+}
+
 pub fn service_start() -> Result<()> {
     require_root()?;
     service::start()
@@ -412,6 +431,7 @@ pub async fn serve(state_dir: &Path, listen: Option<IpAddr>) -> Result<()> {
             settings.port,
         ),
         agent_slots: Arc::new(tokio::sync::Semaphore::new(256)),
+        certificate_task: Default::default(),
         cert: Some(swap.clone()),
         demo: false,
         secure: true,
@@ -459,7 +479,7 @@ pub async fn certificate(state_dir: &Path, lets_encrypt: bool, staging: bool, ad
         println!("The dashboard uses its self-signed certificate again.");
         return service::apply("the self-signed certificate");
     }
-    let address = address.unwrap_or_else(shown_address);
+    let address = certificate_address(&address.unwrap_or_else(shown_address))?;
     ensure!(address != "SERVER-IP", "this server's address was not found; give it with --address");
     let wanted = acme::AcmeSettings { address: address.clone(), staging };
     println!("Asking Let's Encrypt for a certificate for {address}.");
@@ -503,6 +523,7 @@ pub async fn demo(port: u16, empty: bool) -> Result<()> {
         fleet: None,
         public: ("203.0.113.10".into(), port),
         agent_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+        certificate_task: Default::default(),
         cert: None,
         demo: true,
         secure: false,
@@ -540,6 +561,16 @@ fn audit_start(state: &http::AppState, address: SocketAddr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certificate_address_accepts_dns_and_ip_but_not_urls_or_invalid_labels() {
+        assert_eq!(certificate_address(" Dashboard.Example.COM. ").unwrap(), "dashboard.example.com");
+        assert_eq!(certificate_address("203.0.113.10").unwrap(), "203.0.113.10");
+        assert_eq!(certificate_address("2001:db8::1").unwrap(), "2001:db8::1");
+        for invalid in ["", "https://example.com", "example.com:443", "a..example.com", "-a.example.com", "a-.example.com", "localhost", "*.example.com", "some/path.example"] {
+            assert!(certificate_address(invalid).is_err(), "{invalid:?}");
+        }
+    }
 
     #[test]
     fn passwords_are_long_and_use_only_unambiguous_letters() {

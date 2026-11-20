@@ -98,6 +98,15 @@ pub fn parse_version(text: &str) -> Option<[u64; 3]> {
     parts.next().is_none().then_some(numbers)
 }
 
+/// SemVer ordering for real releases, including fork-specific prerelease identifiers.
+/// Protocol compatibility still uses the numeric triplet from `parse_version`.
+fn release_version_newer(installed: &str, candidate: &str) -> bool {
+    match (semver::Version::parse(installed), semver::Version::parse(candidate)) {
+        (Ok(old), Ok(new)) => new > old,
+        _ => false,
+    }
+}
+
 /// The CPU architecture of an ELF file (`e_machine`), if it is one.
 pub fn elf_machine(path: &Path) -> Option<u16> {
     use std::io::Read;
@@ -562,9 +571,8 @@ fn perform_with_sync(
             .context("the installed program cannot provide a compatible recovery path; a coordinated migration requires --no-restart")?;
     }
     if !options.allow_downgrade {
-        let (old, new) = (parse_version(&old_version), parse_version(&new_version));
         ensure!(
-            matches!((old, new), (Some(old), Some(new)) if new > old),
+            release_version_newer(&old_version, &new_version),
             "the installed version {old_version} is not older than {new_version}; use --allow-downgrade to install it anyway"
         );
     }
@@ -1349,6 +1357,11 @@ mod tests {
 
     #[test]
     fn versions_are_read_and_compared_as_numbers() {
+        assert!(release_version_newer("0.12.0-ach.1", "0.12.0-ach.2"));
+        assert!(release_version_newer("0.12.0-ach.2", "0.13.0-ach.1"));
+        assert!(!release_version_newer("0.12.0-ach.2", "0.12.0-ach.1"));
+        assert!(!release_version_newer("0.12.0", "0.12.0-ach.1"));
+        assert!(release_version_newer("0.12.0-ach.1", "0.12.0"));
         assert_eq!(parse_version("0.7.0"), Some([0, 7, 0]));
         assert_eq!(parse_version("0.10.2"), Some([0, 10, 2]));
         assert_eq!(parse_version("1.2.3-rc1"), Some([1, 2, 3]));

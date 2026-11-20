@@ -12,7 +12,7 @@ use std::{
     sync::Mutex,
 };
 
-pub const REPOSITORY: &str = "B3hnamR/EZTunnel";
+use crate::release::REPOSITORY;
 const MEMBER: &str = "eztunnel-linux/bin/eztunnel";
 /// The largest program file accepted (the updater has the same limit).
 pub const MAX_PROGRAM: u64 = 64 << 20;

@@ -46,6 +46,13 @@ const ALL: &str = "*";
 /// How long a signed-in browser may take to upload a file.
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(15 * 60);
 
+#[derive(Default, Clone)]
+pub struct CertificateTask {
+    pub running: bool,
+    pub error: Option<String>,
+    pub address: Option<String>,
+}
+
 pub struct AppState {
     pub history: Arc<super::history::History>,
     pub auth: auth::Auth,
@@ -64,6 +71,7 @@ pub struct AppState {
     pub agent_slots: Arc<Semaphore>,
     /// The certificate being served (HTTPS only): join commands pin its key.
     pub cert: Option<Arc<super::tls::Swap>>,
+    pub certificate_task: Mutex<CertificateTask>,
     pub demo: bool,
     /// HTTPS: cookies are marked Secure and carry the __Host- prefix.
     pub secure: bool,
@@ -152,6 +160,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/alerts", get(alerts_list))
         .route("/api/alerts/test", post(alerts_test))
         .route("/api/settings", get(settings_get).post(settings_set))
+        .route("/api/dashboard/certificate", get(certificate_status).post(certificate_set))
         .route("/api/password", post(password_set))
         .route("/api/sessions", get(sessions_list))
         .route("/api/sessions/revoke", post(sessions_revoke))
@@ -1393,13 +1402,68 @@ async fn settings_get(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
         return unauthorized();
     }
     let prefs = super::prefs::load(&state.state_dir);
-    let cert = state.cert.as_ref().map(|c| json!({"not_after": c.not_after(), "lets_encrypt": state.state_dir.join("acme-chain.pem").exists()}));
+    let configured_certificate = super::load_settings(&state.state_dir).ok().and_then(|s| s.acme);
+    let cert = state.cert.as_ref().map(|c| json!({"not_after": c.not_after(), "lets_encrypt": configured_certificate.is_some()}));
     Json(json!({
         "prefs": super::prefs::shown(&prefs),
         "telegram_last": super::alerts::last_delivery(&state.state_dir),
-        "panel": {"address": state.public.0, "port": state.public.1, "https": state.secure, "cert": cert, "version": env!("CARGO_PKG_VERSION"), "state_dir": state.state_dir.display().to_string()},
+        "panel": {"address": state.public.0, "port": state.public.1, "https": state.secure, "cert": cert, "certificate_address": configured_certificate.map(|s| s.address), "version": env!("CARGO_PKG_VERSION"), "state_dir": state.state_dir.display().to_string()},
     }))
     .into_response()
+}
+
+/// Configuring a domain may take several minutes (ACME HTTP-01). Keep the HTTP request
+/// short and expose progress/errors without risking a client timeout during the order.
+async fn certificate_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !state.signed_in(&headers) { return unauthorized(); }
+    let task = state.certificate_task.lock().unwrap().clone();
+    Json(json!({"running": task.running, "error": task.error, "address": task.address})).into_response()
+}
+
+async fn certificate_set(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if !state.signed_in(request.headers()) { return unauthorized(); }
+    if state.demo { return failed_with(StatusCode::BAD_REQUEST, "the demo cannot change certificates"); }
+    let ip = client_ip(&request);
+    let form = match read_json(request).await {
+        Ok(form) => form,
+        Err(response) => return response,
+    };
+    let (letsencrypt, address) = match form["mode"].as_str() {
+        Some("lets_encrypt") => {
+            let Some(domain) = form["address"].as_str() else {
+                return failed_with(StatusCode::BAD_REQUEST, "enter a domain name or IP address");
+            };
+            match super::certificate_address(domain) {
+                Ok(value) => (true, Some(value)),
+                Err(error) => return failed_with(StatusCode::BAD_REQUEST, format!("{error:#}")),
+            }
+        }
+        Some("self_signed") => (false, None),
+        _ => return failed_with(StatusCode::BAD_REQUEST, "mode must be lets_encrypt or self_signed"),
+    };
+    {
+        let mut task = state.certificate_task.lock().unwrap();
+        if task.running { return failed_with(StatusCode::CONFLICT, "a certificate change is already running"); }
+        *task = CertificateTask { running: true, error: None, address: address.clone() };
+    }
+    let next_address = address.clone().unwrap_or_else(super::shown_address);
+    let url = format!("https://{}:{}", if next_address.contains(':') { format!("[{next_address}]") } else { next_address.clone() }, state.public.1);
+    state.audit.record(ip, "action", &format!("configure dashboard certificate for {next_address}"));
+    tokio::spawn(async move {
+        // Reuse the CLI ACME/renewal/settings path. On success it restarts the dashboard,
+        // so this task and the browser's old TLS connection may disappear.
+        let result = super::certificate(&state.state_dir, letsencrypt, false, address).await;
+        let mut task = state.certificate_task.lock().unwrap();
+        task.running = false;
+        if let Err(error) = result {
+            let detail = format!("{error:#}");
+            state.audit.record(ip, "certificate_failed", &detail);
+            task.error = Some(detail);
+        } else {
+            state.audit.record(ip, "certificate", "certificate changed; reload the dashboard");
+        }
+    });
+    (StatusCode::ACCEPTED, Json(json!({"started": true, "url": url}))).into_response()
 }
 
 async fn settings_set(State(state): State<Arc<AppState>>, request: Request) -> Response {
@@ -2765,6 +2829,7 @@ mod tests {
             public: ("203.0.113.10".into(), 38_471),
             agent_slots: Arc::new(Semaphore::new(4)),
             cert: None,
+            certificate_task: Default::default(),
             demo: true,
             secure: false,
             state_dir: std::env::temp_dir().join(format!("ezd-test-{}-{:?}", std::process::id(), std::thread::current().id()).replace(['(', ')'], "")),
@@ -2863,6 +2928,21 @@ mod tests {
         waiting.as_mut().enable();
         PATH_CANCEL.notify_waiters();
         tokio::time::timeout(Duration::from_secs(1), waiting).await.expect("Cancel reaches the search");
+    }
+
+    /// Domain controls are not public and the demo never mutates host TLS state.
+    #[tokio::test]
+    async fn dashboard_certificate_controls_need_a_session_and_refuse_demo_changes() {
+        let (app, _) = app().await;
+        let path = "/api/dashboard/certificate";
+        let anon = call(&app, hyper::Request::get(path).body(Body::empty()).unwrap()).await;
+        assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(call(&app, post(path, r#"{"mode":"lets_encrypt","address":"test.example.com"}"#, true)).await.status(), StatusCode::UNAUTHORIZED);
+        let cookie = signed_in(&app).await;
+        let status = json_of(call(&app, with_cookie(hyper::Request::get(path).body(Body::empty()).unwrap(), &cookie)).await).await;
+        assert_eq!(status["running"], false);
+        assert_eq!(status["error"], Value::Null);
+        assert_eq!(call(&app, with_cookie(post(path, r#"{"mode":"lets_encrypt","address":"test.example.com"}"#, true), &cookie)).await.status(), StatusCode::BAD_REQUEST);
     }
 
     /// Only safe display names are kept; empty means the server's own name again.

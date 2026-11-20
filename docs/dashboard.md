@@ -254,16 +254,24 @@ saved or not, and the panel shows how the last message went. If Telegram is not 
 ## Certificate
 
 To open the dashboard without a browser warning, use a free Let's Encrypt certificate for the
-server's IP address or for a domain that points to it: **Tools → Web dashboard → Use a Let's
-Encrypt certificate**, or
+server's IP address or for a domain that points to it. In the **Settings → Dashboard access** panel,
+enter the domain or IP (without `https://` or a port), then select **Get certificate**. The form
+immediately confirms the request and shows its progress or detailed failure. After successful
+issuance the dashboard restarts, and you can open the new `https://domain:port` address (the port
+is unchanged; the browser may ask you to sign in again). The dashboard retains its Noise identity
+so enrolled agents and tunnels are unaffected if their configured connection address remains reachable.
+Alternatively use **Tools → Web dashboard → Use a Let's Encrypt certificate**, or
 
 ```sh
 sudo eztunnel dashboard certificate --lets-encrypt --address 203.0.113.10
 ```
 
-Let's Encrypt checks the server over port 80 for about a minute, so port 80 must be free and open
-while it runs. The dashboard renews the certificate by itself. `--self-signed` goes back to the
-self-signed certificate.
+Point the domain's DNS records to this server before requesting the certificate. Let's Encrypt
+checks over **port 80 HTTP-01**, so that port must be free and publicly reachable during issuance
+and renewal. The dashboard's existing HTTPS port must remain reachable, too. Renewal is automatic.
+For a CDN/proxy domain, ensure the HTTP-01 challenge reaches this host rather than a cached or
+intercepted route. The **Use self-signed** button (or CLI `--self-signed`) restores the old mode and
+restarts the dashboard; browsers can show a certificate warning in that mode.
 
 ## Managing the dashboard
 

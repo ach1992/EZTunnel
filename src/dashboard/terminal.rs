@@ -2323,6 +2323,7 @@ mod tests {
             public: ("127.0.0.1".into(), port),
             agent_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             cert: None,
+            certificate_task: Default::default(),
             demo: false,
             secure: true,
             state_dir: dir.path().into(),
