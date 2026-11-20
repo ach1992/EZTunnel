@@ -488,32 +488,86 @@ fn commit_queued(state_dir: &Path, guard: &Guard, tx: &mut Transaction) -> Resul
     Ok(expected)
 }
 
-/// A valid independently published certificate is not ours to overwrite. This
-/// can occur when encountering an old or external writer not using our lock.
-/// Release the aborted transaction, retaining that valid selection for retry.
-fn release_if_superseded(
+/// An unsynchronized older writer may have installed a different *valid*
+/// certificate. Preserve its selection, but never treat its persistence as
+/// proof that the Dashboard actually started and serves that identity.
+fn superseded_leaf(
     state_dir: &Path,
-    tx: &mut Transaction,
-    guard: &Guard,
+    tx: &Transaction,
     actual: &Selection,
-) -> Result<bool> {
+) -> Result<Option<Vec<u8>>> {
     if actual
         == tx
             .requested
             .as_ref()
             .context("missing requested selection")?
+        || actual == tx.previous.as_ref().context("missing previous selection")?
     {
-        return Ok(false);
+        return Ok(None);
     }
-    if actual == tx.previous.as_ref().context("missing previous selection")? {
-        return Ok(false);
+    Ok(actual.validate(state_dir).ok())
+}
+
+/// Finish only after actual HTTPS readiness. Keep rollback material when the
+/// certificate is valid on disk but not verified live, or settings change during
+/// verification. This part is separately testable without invoking systemd.
+fn finish_superseded(
+    state_dir: &Path,
+    tx: &mut Transaction,
+    selection: &Selection,
+    verification: Result<()>,
+) -> Result<()> {
+    let guard = Guard::acquire(state_dir)?;
+    let result = verification.and_then(|()| {
+        ensure!(
+            Selection::current(state_dir)? == *selection,
+            "certificate selection changed while verifying live HTTPS readiness"
+        );
+        Ok(())
+    });
+    match result {
+        Ok(()) => tx.finish(state_dir, &guard, Phase::Recovered,
+            "a valid independent certificate superseded the activation; the existing selection was preserved and its live HTTPS endpoint verified"),
+        Err(error) => {
+            tx.phase = Phase::RecoveryFailed;
+            tx.detail = Some(format!(
+                "an independent certificate superseded activation but live HTTPS readiness was not verified ({error:#}); valid settings were preserved. Retry 'eztunnel dashboard recover-certificate --state-dir {}' after fixing the service",
+                state_dir.display()
+            ));
+            tx.save(state_dir, &guard)?;
+            Err(error.context("independent certificate is persisted but Dashboard recovery is unverified"))
+        }
     }
-    if actual.validate(state_dir).is_ok() {
-        tx.finish(state_dir, guard, Phase::Failed,
-            "certificate activation was superseded by a valid independent selection; its key and certificate were preserved, retry the requested change if still wanted")?;
-        return Ok(true);
-    }
-    Ok(false)
+}
+
+/// The external certificate can be kept only if its actual TLS leaf and
+/// Dashboard API are reachable. Avoid unnecessary restarts of a healthy service;
+/// if not healthy, restart and verify while outside the transaction lock.
+async fn verify_superseded(
+    state_dir: &Path,
+    tx: &mut Transaction,
+    selection: &Selection,
+    leaf: &[u8],
+) -> Result<()> {
+    let live = if service::active(service::UNIT) {
+        match load_settings(state_dir) {
+            Ok(settings) => super::terminal::probe_https(settings.port, leaf)
+                .await
+                .is_ok(),
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+    let result = if live {
+        Ok(())
+    } else {
+        match service::reset_failed().and_then(|()| service::restart()) {
+            Ok(()) => ready(state_dir, leaf, READY_DEADLINE).await,
+            Err(error) => Err(error),
+        }
+    };
+    finish_superseded(state_dir, tx, selection, result)
 }
 
 async fn restore(state_dir: &Path, tx: &mut Transaction, cause: &anyhow::Error) -> Result<()> {
@@ -528,7 +582,7 @@ async fn restore(state_dir: &Path, tx: &mut Transaction, cause: &anyhow::Error) 
         .as_ref()
         .context("missing attempted certificate")?
         .clone();
-    {
+    let superseded = {
         let guard = Guard::acquire(state_dir)?;
         tx.phase = Phase::Restoring;
         tx.detail = Some(format!(
@@ -538,18 +592,27 @@ async fn restore(state_dir: &Path, tx: &mut Transaction, cause: &anyhow::Error) 
         let actual = Selection::current(state_dir)?;
         if actual == requested {
             commit(state_dir, &requested, &recovery)?;
+            None
         } else if actual == previous && recovery != previous {
             commit(state_dir, &previous, &recovery)?;
-        } else if actual != recovery && !release_if_superseded(state_dir, tx, &guard, &actual)? {
-            tx.phase = Phase::RecoveryFailed;
-            tx.detail = Some("unexpected invalid certificate selection while restoring; previous recovery material preserved; run recover-certificate".into());
-            tx.save(state_dir, &guard)?;
-            bail!("cannot safely replace an unrelated unusable certificate during rollback");
+            None
         } else if actual != recovery {
-            bail!(
-                "activation was superseded by an independent valid certificate; no rollback was performed"
-            );
+            if let Some(leaf) = superseded_leaf(state_dir, tx, &actual)? {
+                // The journal remains Restoring, with previous/requested material.
+                // A valid file is not enough: verify outside this lock first.
+                Some((actual, leaf))
+            } else {
+                tx.phase = Phase::RecoveryFailed;
+                tx.detail = Some("unexpected invalid certificate selection while restoring; previous recovery material preserved; run recover-certificate".into());
+                tx.save(state_dir, &guard)?;
+                bail!("cannot safely replace an unrelated unusable certificate during rollback");
+            }
+        } else {
+            None
         }
+    };
+    if let Some((selection, leaf)) = superseded {
+        return verify_superseded(state_dir, tx, &selection, &leaf).await;
     }
     // Restart even when the unit stopped or systemd's start limit was reached.
     let restart = service::reset_failed().and_then(|()| service::restart());
@@ -617,7 +680,7 @@ pub async fn run(state_dir: &Path) -> Result<()> {
 /// released instead of requiring the operator to edit private JSON files.
 pub async fn recover(state_dir: &Path) -> Result<()> {
     super::require_root()?;
-    let (mut tx, recovery, expected) = {
+    let (mut tx, recovery, expected, superseded) = {
         let guard = Guard::acquire(state_dir)?;
         ensure!(
             !service::active(UNIT),
@@ -640,31 +703,38 @@ pub async fn recover(state_dir: &Path) -> Result<()> {
             .context("missing last attempted certificate")?
             .clone();
         let actual = Selection::current(state_dir)?;
-        if release_if_superseded(state_dir, &mut tx, &guard, &actual)? {
-            println!(
-                "A valid independent certificate superseded the interrupted activation; it was preserved and the aborted transaction was released."
-            );
-            return Ok(());
-        }
-        // An independently changed *valid* certificate is released above.
-        // An invalid outsider is not ours to overwrite automatically. An
-        // explicit recovery command may restore the previous identity only if
-        // that invalid selection still targets the affected ACME address.
-        let known = actual == requested || actual == previous || actual == recovery;
-        let correct_domain = actual.acme == previous.acme || actual.acme == requested.acme;
-        if !known && !(correct_domain && actual.validate(state_dir).is_err()) {
-            tx.phase = Phase::RecoveryFailed;
-            tx.detail = Some("Dashboard settings changed independently to an unrelated selection; no certificate was overwritten; inspect the configured identity before retrying recovery".into());
+        let superseded =
+            superseded_leaf(state_dir, &tx, &actual)?.map(|leaf| (actual.clone(), leaf));
+        if superseded.is_some() {
+            // Reserve recovery ownership, but retain private rollback material
+            // until the live certificate and Dashboard API are verified.
+            tx.phase = Phase::Restoring;
             tx.save(state_dir, &guard)?;
-            bail!("refusing to overwrite a changed unrelated certificate selection");
         }
-        tx.phase = Phase::Restoring;
-        tx.save(state_dir, &guard)?;
-        if actual != recovery {
-            commit(state_dir, &actual, &recovery)?;
+        if superseded.is_none() {
+            // An independently changed *valid* certificate is released above.
+            // An invalid outsider is not ours to overwrite automatically. An
+            // explicit recovery command may restore the previous identity only if
+            // that invalid selection still targets the affected ACME address.
+            let known = actual == requested || actual == previous || actual == recovery;
+            let correct_domain = actual.acme == previous.acme || actual.acme == requested.acme;
+            if !known && !(correct_domain && actual.validate(state_dir).is_err()) {
+                tx.phase = Phase::RecoveryFailed;
+                tx.detail = Some("Dashboard settings changed independently to an unrelated selection; no certificate was overwritten; inspect the configured identity before retrying recovery".into());
+                tx.save(state_dir, &guard)?;
+                bail!("refusing to overwrite a changed unrelated certificate selection");
+            }
+            tx.phase = Phase::Restoring;
+            tx.save(state_dir, &guard)?;
+            if actual != recovery {
+                commit(state_dir, &actual, &recovery)?;
+            }
         }
-        (tx, recovery, expected)
+        (tx, recovery, expected, superseded)
     };
+    if let Some((selection, leaf)) = superseded {
+        return verify_superseded(state_dir, &mut tx, &selection, &leaf).await;
+    }
     let outcome = service::reset_failed().and_then(|()| service::restart());
     let verified = if let Err(error) = outcome {
         Err(error)
@@ -885,8 +955,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn postcommit_external_renewal_does_not_block_safe_abort_and_retry() {
+    /// A legacy, lock-unaware writer can publish B2 after our worker committed
+    /// B. Tests below exercise the real terminal decision without invoking
+    /// host systemctl. The isolated systemd QA covers the actual TLS probe.
+    fn superseded_fixture() -> (tempfile::TempDir, Transaction, Selection) {
         let dir = tempfile::tempdir().unwrap();
         fixture(dir.path());
         let guard = Guard::acquire(dir.path()).unwrap();
@@ -901,59 +973,85 @@ mod tests {
             .as_ref()
             .unwrap()
             .clone();
-        let renewed = issued(&target.address);
-        let new_saved = acme::SavedCertificate::from_issued(&target, &renewed).unwrap();
-        // This mutation represents a legacy unsynchronized writer, not the
-        // new publish_renewal path which correctly refuses during Applying.
+        let newer = issued(&target.address);
+        let saved = acme::SavedCertificate::from_issued(&target, &newer).unwrap();
         super::super::update_settings(dir.path(), |settings| {
-            settings.acme_certificate = Some(new_saved);
+            settings.acme_certificate = Some(saved);
             Ok(())
         })
         .unwrap();
-        let valid_renewed = Selection::current(dir.path()).unwrap();
+        let selected = Selection::current(dir.path()).unwrap();
+        assert!(
+            superseded_leaf(dir.path(), &tx, &selected)
+                .unwrap()
+                .is_some()
+        );
+        (dir, tx, selected)
+    }
+
+    #[test]
+    fn superseding_valid_certificate_can_finish_only_after_positive_https_evidence() {
+        let (dir, mut tx, selected) = superseded_fixture();
+        assert_eq!(
+            Transaction::load(dir.path()).unwrap().phase,
+            Phase::Applying
+        );
+        // The verification is supplied by the live TLS+API probe in production.
+        finish_superseded(dir.path(), &mut tx, &selected, Ok(())).unwrap();
+        let final_tx = Transaction::load(dir.path()).unwrap();
+        assert_eq!(final_tx.phase, Phase::Recovered);
+        assert!(final_tx.previous.is_none() && final_tx.requested.is_none());
+        assert!(Selection::current(dir.path()).unwrap() == selected);
         let guard = Guard::acquire(dir.path()).unwrap();
-        assert!(release_if_superseded(dir.path(), &mut tx, &guard, &valid_renewed).unwrap());
-        assert_eq!(Transaction::load(dir.path()).unwrap().phase, Phase::Failed);
-        assert!(Selection::current(dir.path()).unwrap() == valid_renewed);
         assert!(admit_locked(dir.path(), &guard, requested_second()).is_ok());
     }
 
-    #[tokio::test]
-    async fn actual_restore_path_releases_superseded_valid_renewal_without_systemd_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        fixture(dir.path());
+    #[test]
+    fn superseding_valid_certificate_with_unverified_https_retains_recovery_and_retries() {
+        let (dir, mut tx, selected) = superseded_fixture();
+        let failure = anyhow::anyhow!("live TLS leaf mismatch or Dashboard API unavailable");
+        assert!(finish_superseded(dir.path(), &mut tx, &selected, Err(failure)).is_err());
+        let saved = Transaction::load(dir.path()).unwrap();
+        assert_eq!(saved.phase, Phase::RecoveryFailed);
+        assert!(saved.previous.is_some() && saved.requested.is_some());
+        assert!(
+            saved
+                .detail
+                .unwrap()
+                .contains("live HTTPS readiness was not verified")
+        );
+        assert!(Selection::current(dir.path()).unwrap() == selected);
         let guard = Guard::acquire(dir.path()).unwrap();
-        let (mut tx, _) = admit_locked(dir.path(), &guard, requested_second()).unwrap();
-        commit_queued(dir.path(), &guard, &mut tx).unwrap();
+        assert!(admit_locked(dir.path(), &guard, requested_second()).is_err());
         drop(guard);
-        let wanted = tx
-            .requested
-            .as_ref()
-            .unwrap()
-            .acme
-            .as_ref()
-            .unwrap()
-            .clone();
-        let renewed = issued(&wanted.address);
-        let new_saved = acme::SavedCertificate::from_issued(&wanted, &renewed).unwrap();
+        // Once the real systemd service has been repaired, the same identity
+        // can be verified without overwriting the valid external certificate.
+        finish_superseded(dir.path(), &mut tx, &selected, Ok(())).unwrap();
+        assert_eq!(
+            Transaction::load(dir.path()).unwrap().phase,
+            Phase::Recovered
+        );
+        assert!(Selection::current(dir.path()).unwrap() == selected);
+    }
+
+    #[test]
+    fn changed_identity_during_readiness_cannot_clear_rollback_journal() {
+        let (dir, mut tx, selected) = superseded_fixture();
+        let target = selected.acme.as_ref().unwrap().clone();
+        let another =
+            acme::SavedCertificate::from_issued(&target, &issued(&target.address)).unwrap();
         super::super::update_settings(dir.path(), |settings| {
-            settings.acme_certificate = Some(new_saved);
+            settings.acme_certificate = Some(another);
             Ok(())
         })
         .unwrap();
-        let preserved = Selection::current(dir.path()).unwrap();
-        assert!(
-            restore(dir.path(), &mut tx, &anyhow::anyhow!("test failure"))
-                .await
-                .is_err()
-        );
-        assert_eq!(Transaction::load(dir.path()).unwrap().phase, Phase::Failed);
-        assert!(Selection::current(dir.path()).unwrap() == preserved);
-        let guard = Guard::acquire(dir.path()).unwrap();
-        assert!(
-            admit_locked(dir.path(), &guard, requested_second()).is_ok(),
-            "another activation should be allowed after a safe aborted restoration"
-        );
+        let current = Selection::current(dir.path()).unwrap();
+        assert!(current != selected);
+        assert!(finish_superseded(dir.path(), &mut tx, &selected, Ok(())).is_err());
+        let saved = Transaction::load(dir.path()).unwrap();
+        assert_eq!(saved.phase, Phase::RecoveryFailed);
+        assert!(saved.previous.is_some() && saved.requested.is_some());
+        assert!(Selection::current(dir.path()).unwrap() == current);
     }
 
     #[test]

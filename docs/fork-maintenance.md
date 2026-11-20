@@ -68,11 +68,15 @@ is **not** held during external certificate issuance, service restart or HTTPS
 readiness. Renewal due during an unfinished activation waits and retries; an
 already-published valid renewal remains the rollback baseline. Conflicts with
 legacy/independent writers cannot strand `Applying`/`Restoring`: a rejected
-pre-commit attempt finishes as failed without changing the renewed certificate,
-and a valid superseding certificate is preserved rather than overwritten.
-Competing CLI/API requests get a clear already-active-transaction error; no
+pre-commit attempt finishes as failed without changing the renewed certificate.
+A valid superseding certificate is preserved, but a transaction becomes terminal
+only after the real Dashboard HTTPS leaf and session API have been verified.
+When the independently valid certificate cannot be served, recovery material
+remains in `RecoveryFailed` for a later `recover-certificate` retry; the worker
+tries a real restart and readiness check before deciding. Competing CLI/API
+requests get a clear already-active-transaction error; no global locking or
 operator-configurable concurrency ceiling is imposed.
- This worker commits a complete key/chain/domain tuple,
+The worker commits a complete key/chain/domain tuple,
 restarts the Dashboard and checks **both** the exact TLS certificate and the live
 `/api/session` response. If startup fails, it restores the previous tuple, resets a failed
 systemd service if necessary, restarts it again and verifies HTTPS before recording recovery.
@@ -87,10 +91,14 @@ sets `/run/eztunnel-r1r-test-container`, uses a private test-only Dashboard serv
 simulates a replacement process that exits before accepting HTTPS. It validates successful
 activation from the authenticated Dashboard API, real previous-process termination, the
 presented TLS leaf, automatic rollback after startup failure, inactive-service handling,
-manual recovery from an interrupted worker, and **two concurrent independent CLI
-processes** competing for the same activation journal. Deterministic Rust tests
-cover renewal before admission, during queued/committed activation, external
-legacy renewal conflicts, retry after a rejected commit, and journal privacy. It neither orders real ACME certificates nor
+manual recovery from an interrupted worker, **two concurrent independent CLI
+processes** competing for the same activation journal, and superseding valid
+certificates during both healthy Dashboard service and failed replacement startup.
+The failed-startup case must retain the private recovery material, preserve the
+superseding certificate and demonstrate a later manual HTTPS-verified recovery.
+Deterministic Rust tests cover renewal before admission, during queued/committed
+activation, external legacy renewal conflicts, retry after a rejected commit,
+HTTPS verification outcomes, and journal privacy. It neither orders real ACME certificates nor
 changes Production or Agent/tunnel units.
 
 ## Local Fleet CLI endpoint selection

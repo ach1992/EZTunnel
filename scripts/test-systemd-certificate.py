@@ -102,6 +102,15 @@ def phase(name: str):
     return data
 
 
+def save_selected(selection):
+    data = settings()
+    data["acme"] = selection["acme"]
+    data["acme_certificate"] = selection["certificate"]
+    path = STATE / "settings.json"
+    path.write_text(json.dumps(data))
+    path.chmod(0o600)
+
+
 def transaction(previous, requested):
     obj = {"phase": "queued", "previous": previous, "requested": requested, "detail": None}
     path = STATE / "certificate-activation.json"
@@ -115,6 +124,76 @@ def activate(binary: Path):
               "--state-dir", STATE, check=False, capture_output=True)
     if run.returncode:
         raise AssertionError(f"activation scheduling failed: {run.stdout} {run.stderr}")
+
+
+def supersession_scenarios(binary: Path):
+    """R1-N3: a valid persisted identity is not evidence of live HTTPS."""
+    # Healthy supersession during a simulated interrupted worker: manual
+    # recovery must preserve B2, verify live HTTPS and avoid needless restart.
+    original = {"acme": None, "certificate": None}
+    requested, _ = cert_for("fail.example.test")
+    healthy, healthy_der = cert_for("healthy-external.example.test")
+    transaction(original, requested)
+    path = STATE / "certificate-activation.json"
+    tx = json.loads(path.read_text())
+    tx["phase"] = "restoring"
+    path.write_text(json.dumps(tx))
+    path.chmod(0o600)
+    save_selected(healthy)
+    system("reset-failed", "eztunnel-dashboard.service")
+    system("restart", "eztunnel-dashboard.service")
+    until("healthy independent certificate is serving HTTPS",
+          lambda: check_service_live(healthy_der), seconds=40)
+    old_pid = pid()
+    cmd(binary, "dashboard", "recover-certificate", "--state-dir", STATE,
+        check=True, capture_output=True)
+    assert phase("recovered")
+    assert check_service_live(healthy_der)
+    assert pid() == old_pid, "already-healthy superseding certificate should not force another restart"
+    assert state_of_cert(healthy, healthy_der)
+    assert json.loads(path.read_text())["previous"] is None
+    print("HEALTHY_EXTERNAL_SUPERSESSION_VERIFIED_OK", flush=True)
+
+    # A real failed startup. When the broken replacement B is starting,
+    # a test-only legacy writer switches settings to valid B2 and the wrapper
+    # holds the service down. The worker must preserve B2 AND rollback journal.
+    replacement, _ = cert_for("fail.example.test")
+    superseded, superseded_der = cert_for("external-after-failed-start.example.test")
+    transaction(healthy, replacement)
+    persisted = settings()
+    persisted["acme"] = superseded["acme"]
+    persisted["acme_certificate"] = superseded["certificate"]
+    staged = STATE / "supersede-next.json"
+    staged.write_text(json.dumps(persisted))
+    staged.chmod(0o600)
+    blocked = STATE / "block-superseded"
+    blocked.touch()
+    try:
+        activate(binary)
+        until("failed startup with valid external supersession remains recoverable",
+              lambda: phase("recovery_failed"), seconds=130)
+        assert settings()["acme"] == superseded["acme"]
+        assert settings()["acme_certificate"] == superseded["certificate"]
+        journal = json.loads(path.read_text())
+        assert journal["previous"] is not None and journal["requested"] is not None
+        assert "live HTTPS readiness was not verified" in journal["detail"]
+        assert not check_service_live(superseded_der)
+        print("FAILED_SUPERSESSION_RETAINS_RECOVERY_OK", flush=True)
+    finally:
+        blocked.unlink(missing_ok=True)
+        staged.unlink(missing_ok=True)
+
+    until("failed supersession worker to terminate before manual retry",
+          lambda: system("is-active", "--quiet", WORKER, check=False).returncode != 0,
+          seconds=25)
+    cmd(binary, "dashboard", "recover-certificate", "--state-dir", STATE,
+        check=True, capture_output=True)
+    until("recovery of valid independent certificate with actual HTTPS verification",
+          lambda: check_service_live(superseded_der) and phase("recovered"), seconds=40)
+    assert state_of_cert(superseded, superseded_der)
+    journal = json.loads(path.read_text())
+    assert journal["previous"] is None and journal["requested"] is None
+    print("FAILED_SUPERSESSION_MANUAL_RECOVERY_VERIFIED_OK", flush=True)
 
 
 def request_self_signed_in_browser_api(port: int, password: str):
@@ -208,9 +287,11 @@ def main(binary: Path):
         WRAPPER.write_text(
             "#!/bin/sh\n"
             f"if grep -q 'fail.example.test' '{STATE}/settings.json'; then\n"
+            f"  if [ -f '{STATE}/supersede-next.json' ]; then mv '{STATE}/supersede-next.json' '{STATE}/settings.json'; chmod 600 '{STATE}/settings.json'; fi\n"
             "  echo 'intentional test-only replacement startup failure' >&2\n"
             "  exit 66\n"
             "fi\n"
+            f"if [ -f '{STATE}/block-superseded' ]; then echo 'intentional blocked superseded replacement' >&2; exit 67; fi\n"
             f"if [ -f '{STATE}/slow-start' ]; then sleep 3; fi\n"
             f"exec '{binary}' dashboard serve --state-dir '{STATE}'\n"
         )
@@ -312,6 +393,11 @@ def main(binary: Path):
             concurrent_certificate_cli_requests(binary, port, old_cert)
         finally:
             (STATE / "slow-start").unlink(missing_ok=True)
+        # These tests change only the marked QA unit and its disposable state.
+        # Allow the prior tightly packed restarts to leave systemd's default
+        # start-rate interval before deliberate supersession failure injection.
+        time.sleep(10)
+        supersession_scenarios(binary)
         print("SYSTEMD_CERTIFICATE_ACCEPTANCE_PASS", flush=True)
     finally:
         # Never tear down the test Dashboard service while an independent worker

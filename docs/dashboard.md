@@ -292,6 +292,12 @@ While a certificate change is applying, a second CLI/API change receives an
 explicit in-progress error instead of replacing its recovery transaction. Automatic
 Let's Encrypt renewal is deferred during that activation and resumes afterward;
 a successful renewal is never overwritten by a stale pre-activation snapshot.
+If an older process publishes another valid certificate, the worker preserves
+that identity but verifies its live HTTPS leaf and Dashboard session API before
+clearing the recovery transaction. If the HTTPS endpoint cannot be verified,
+`dashboard status` reports `recovery_failed` and `recover-certificate` can retry
+after the service problem is addressed; a saved valid certificate alone does not
+count as an active service.
 
 If an unexpected interruption kills even the independent activation worker, the previous
 configuration remains available in `certificate-activation.json`. Run `sudo eztunnel dashboard
