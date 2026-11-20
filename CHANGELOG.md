@@ -10,6 +10,8 @@
 - Systemd-managed certificate activation now runs in an independent transient unit, verifies the live HTTPS leaf and Dashboard API, automatically restores the previous selection after a failed restart, and offers an explicit recover-certificate CLI for interrupted workers; verified in an isolated Debian/systemd test container.
 - Serialize certificate activation transactions across processes and coordinate ACME renewal publication: preserve valid renewed certificates, reject competing admissions without losing recovery material, and terminate pre-commit conflicts safely for retries.
 - Preserve the rollback journal during a valid but unverified external certificate supersession; verify the real HTTPS certificate and Dashboard API, attempt service recovery when needed, and keep a retryable failure record until readiness succeeds.
+- Prevent concurrent manual recovery processes from completing stale certificate transactions over newer activation journals; scope recovery ownership per installation, automatically release it on process exit, and reject stale terminal updates under the existing short journal guard.
+- Retry manual Dashboard recovery from stopped/unloaded systemd units without a spurious `reset-failed` error; reset only genuinely failed units before restart.
 
 ## 0.12.0 (2026-11-20)
 

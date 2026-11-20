@@ -194,6 +194,124 @@ def supersession_scenarios(binary: Path):
     journal = json.loads(path.read_text())
     assert journal["previous"] is None and journal["requested"] is None
     print("FAILED_SUPERSESSION_MANUAL_RECOVERY_VERIFIED_OK", flush=True)
+    return superseded, superseded_der
+
+
+def recovery_lock_is_held():
+    """Probe the recovery lock from this *other* process, without modifying it."""
+    with open(STATE / "certificate-recovery.lock", "a+b") as probe:
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        else:
+            fcntl.flock(probe, fcntl.LOCK_UN)
+            return False
+
+
+def mark_manual_recovery(previous, requested):
+    transaction(previous, requested)
+    journal = STATE / "certificate-activation.json"
+    tx = json.loads(journal.read_text())
+    tx["phase"] = "recovery_failed"
+    tx["detail"] = "test-only manually recoverable interrupted activation"
+    journal.write_text(json.dumps(tx))
+    journal.chmod(0o600)
+
+
+def concurrent_manual_recovery_scenarios(binary: Path, selected, selected_der, self_signed_der):
+    """R1-N4: two distinct recovery CLI processes, new T2 and killed-owner retry."""
+    until("prior activation worker is inactive",
+          lambda: system("is-active", "--quiet", WORKER, check=False).returncode != 0,
+          seconds=25)
+    unexpected, _ = cert_for("manual-recovery-race.example.test")
+    argv = [str(binary), "dashboard", "recover-certificate", "--state-dir", str(STATE)]
+    # Prior deliberately failed startups repeatedly restart the same fixture.
+    # Run manual ownership acceptance outside systemd's normal start-rate burst.
+    time.sleep(10)
+    system("reset-failed", "eztunnel-dashboard.service")
+
+    # Both recovery commands see one valid superseding B2 while the service is
+    # stopped. The wrapper deliberately delays the newly started service, so
+    # the first process owns the recovery lock throughout a real HTTPS wait.
+    mark_manual_recovery({"acme": None, "certificate": None}, unexpected)
+    system("stop", "eztunnel-dashboard.service")
+    slow = STATE / "slow-start"
+    slow.touch()
+    try:
+        first = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        def owner_started():
+            if first.poll() is not None:
+                out, err = first.communicate(timeout=3)
+                raise AssertionError(f"first recovery exited before owning journal (exit={first.returncode}): {out} {err}")
+            return recovery_lock_is_held() and phase("restoring")
+        until("first manual recovery owns the OS lock and Restoring journal",
+              owner_started, seconds=15)
+        second = subprocess.run(argv, text=True, capture_output=True, timeout=15)
+        assert second.returncode != 0 and "another recover-certificate process" in second.stderr, (
+            f"a second recovery must not own or finalize the first transaction: {second}"
+        )
+        assert phase("restoring"), "the refused second process must not change the journal"
+        first_stdout, first_stderr = first.communicate(timeout=60)
+        assert first.returncode == 0, f"first recovery failed: {first_stdout} {first_stderr}"
+        assert phase("recovered") and check_service_live(selected_der)
+        assert state_of_cert(selected, selected_der)
+        completed = json.loads((STATE / "certificate-activation.json").read_text())
+        assert completed["previous"] is None and completed["requested"] is None
+        print("CONCURRENT_MANUAL_RECOVERY_OK accepted=1 refused=1", flush=True)
+
+        # A new T2 is now admitted *after* T1 finished. With a slow replacement
+        # startup, the expected T2 journal must remain owned by its new worker:
+        # no stale T1 manual recovery is allowed to overwrite it.
+        third = cmd(binary, "dashboard", "certificate", "--self-signed",
+                    "--state-dir", STATE, capture_output=True, check=True)
+        until("new activation owns a different queued/applying journal",
+              lambda: phase("queued") or phase("applying"), seconds=15)
+        t2 = json.loads((STATE / "certificate-activation.json").read_text())
+        assert t2["previous"] is not None and t2["requested"] is not None
+        assert t2["requested"]["acme"] is None
+        until("new activation T2 completes without stale recovery overwrite",
+              lambda: check_service_live(self_signed_der) and phase("active"), seconds=70)
+        assert settings().get("acme") is None
+        print("NEW_ACTIVATION_JOURNAL_SURVIVES_PRIOR_RECOVERY_OK", flush=True)
+    finally:
+        slow.unlink(missing_ok=True)
+        if 'first' in locals() and first.poll() is None:
+            first.kill()
+            first.communicate(timeout=10)
+
+    # Killing a recovery process must release the OS lock. The partially
+    # restored journal remains usable by a fresh operator after the failure.
+    time.sleep(10)  # let normal systemd start-limit window elapse in this busy fixture
+    mark_manual_recovery({"acme": None, "certificate": None}, unexpected)
+    system("stop", "eztunnel-dashboard.service")
+    slow.touch()
+    first = None
+    try:
+        first = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        until("interrupted recovery owns OS lock and durable Restoring state",
+              lambda: recovery_lock_is_held() and phase("restoring"), seconds=15)
+        first.kill()
+        first.communicate(timeout=10)
+        assert first.returncode != 0
+        until("kernel releases recovery lock after process termination",
+              lambda: not recovery_lock_is_held(), seconds=10)
+        tx = json.loads((STATE / "certificate-activation.json").read_text())
+        assert tx["phase"] == "restoring" and tx["previous"] is not None
+    finally:
+        slow.unlink(missing_ok=True)
+        if first is not None and first.poll() is None:
+            first.kill()
+            first.communicate(timeout=10)
+    # A child systemctl subprocess may have continued to start the service;
+    # either way, the new recovery can safely retry without clearing T1 first.
+    cmd(binary, "dashboard", "recover-certificate", "--state-dir", STATE,
+        check=True, capture_output=True, timeout=65)
+    until("recovery after killed operator serves the previous HTTPS identity",
+          lambda: phase("recovered") and check_service_live(self_signed_der), seconds=40)
+    tx = json.loads((STATE / "certificate-activation.json").read_text())
+    assert tx["previous"] is None and tx["requested"] is None
+    print("INTERRUPTED_MANUAL_RECOVERY_RETRY_OK", flush=True)
 
 
 def request_self_signed_in_browser_api(port: int, password: str):
@@ -397,7 +515,8 @@ def main(binary: Path):
         # Allow the prior tightly packed restarts to leave systemd's default
         # start-rate interval before deliberate supersession failure injection.
         time.sleep(10)
-        supersession_scenarios(binary)
+        latest, latest_der = supersession_scenarios(binary)
+        concurrent_manual_recovery_scenarios(binary, latest, latest_der, old_cert)
         print("SYSTEMD_CERTIFICATE_ACCEPTANCE_PASS", flush=True)
     finally:
         # Never tear down the test Dashboard service while an independent worker

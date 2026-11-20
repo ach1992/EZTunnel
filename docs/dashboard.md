@@ -297,7 +297,11 @@ that identity but verifies its live HTTPS leaf and Dashboard session API before
 clearing the recovery transaction. If the HTTPS endpoint cannot be verified,
 `dashboard status` reports `recovery_failed` and `recover-certificate` can retry
 after the service problem is addressed; a saved valid certificate alone does not
-count as an active service.
+count as an active service. Only one manual `recover-certificate` attempt may
+operate on the same installation at a time; another invocation receives a clear
+retry error instead of racing its journal. If a recovery process is interrupted,
+the OS releases its lock and the original private recovery transaction remains
+available for a new attempt.
 
 If an unexpected interruption kills even the independent activation worker, the previous
 configuration remains available in `certificate-activation.json`. Run `sudo eztunnel dashboard

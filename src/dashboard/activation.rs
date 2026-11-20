@@ -13,6 +13,7 @@ use std::{
 
 const FILE: &str = "certificate-activation.json";
 const LOCK_FILE: &str = "certificate-activation.lock";
+const RECOVERY_LOCK_FILE: &str = "certificate-recovery.lock";
 
 /// One state-directory lock serializes admission, journal mutations and renewal
 /// publication across CLI, Dashboard and the independent systemd worker. Never
@@ -21,7 +22,20 @@ struct Guard(File);
 
 impl Guard {
     fn acquire(state_dir: &Path) -> Result<Self> {
-        let path = state_dir.join(LOCK_FILE);
+        Self::lock(state_dir, LOCK_FILE, false)
+    }
+
+    /// A separate nonblocking advisory lock covers an entire *manual* recovery.
+    /// The short transaction lock must still be released for service restart
+    /// and HTTPS verification, but another recover-certificate process cannot
+    /// own the old journal or finish it after a new activation is admitted.
+    /// The kernel releases this lock if the recovery process terminates.
+    fn try_recovery(state_dir: &Path) -> Result<Self> {
+        Self::lock(state_dir, RECOVERY_LOCK_FILE, true)
+    }
+
+    fn lock(state_dir: &Path, file_name: &str, nonblocking: bool) -> Result<Self> {
+        let path = state_dir.join(file_name);
         let mut options = OpenOptions::new();
         options.create(true).write(true).truncate(false);
         #[cfg(unix)]
@@ -37,10 +51,16 @@ impl Guard {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            ensure!(
-                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0,
-                "lock Dashboard certificate transaction"
-            );
+            let flags = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+            if unsafe { libc::flock(file.as_raw_fd(), flags) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if nonblocking && error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                    bail!(
+                        "another recover-certificate process is already recovering the Dashboard; retry after it finishes"
+                    );
+                }
+                return Err(error).with_context(|| format!("lock {}", path.display()));
+            }
         }
         Ok(Self(file))
     }
@@ -508,6 +528,20 @@ fn superseded_leaf(
     Ok(actual.validate(state_dir).ok())
 }
 
+/// Refuse stale terminal writes even if another actor replaced the journal
+/// while this operation was outside the short transaction lock. A new Queued
+/// transaction always remains authoritative over an older recovery snapshot.
+fn ensure_restoring_owner(state_dir: &Path, tx: &Transaction, _guard: &Guard) -> Result<()> {
+    let current = Transaction::load(state_dir)?;
+    ensure!(
+        current.phase == Phase::Restoring
+            && current.previous == tx.previous
+            && current.requested == tx.requested,
+        "certificate activation transaction changed while recovery was verifying HTTPS; refusing stale recovery journal write"
+    );
+    Ok(())
+}
+
 /// Finish only after actual HTTPS readiness. Keep rollback material when the
 /// certificate is valid on disk but not verified live, or settings change during
 /// verification. This part is separately testable without invoking systemd.
@@ -518,6 +552,7 @@ fn finish_superseded(
     verification: Result<()>,
 ) -> Result<()> {
     let guard = Guard::acquire(state_dir)?;
+    ensure_restoring_owner(state_dir, tx, &guard)?;
     let result = verification.and_then(|()| {
         ensure!(
             Selection::current(state_dir)? == *selection,
@@ -680,6 +715,10 @@ pub async fn run(state_dir: &Path) -> Result<()> {
 /// released instead of requiring the operator to edit private JSON files.
 pub async fn recover(state_dir: &Path) -> Result<()> {
     super::require_root()?;
+    // Keep the recovery-specific lock until the final journal update (or
+    // failure). It never blocks normal activation/renewal or holds the short
+    // certificate transaction lock across systemd/network operations.
+    let _recovery_owner = Guard::try_recovery(state_dir)?;
     let (mut tx, recovery, expected, superseded) = {
         let guard = Guard::acquire(state_dir)?;
         ensure!(
@@ -742,6 +781,7 @@ pub async fn recover(state_dir: &Path) -> Result<()> {
         ready(state_dir, &expected, READY_DEADLINE).await
     };
     let guard = Guard::acquire(state_dir)?;
+    ensure_restoring_owner(state_dir, &tx, &guard)?;
     if let Err(error) = verified {
         tx.phase = Phase::RecoveryFailed;
         tx.detail = Some(format!(
@@ -986,6 +1026,12 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        // The real restore()/recover() path records ownership as Restoring
+        // before dropping its short journal lock for live HTTPS readiness.
+        let guard = Guard::acquire(dir.path()).unwrap();
+        tx.phase = Phase::Restoring;
+        tx.save(dir.path(), &guard).unwrap();
+        drop(guard);
         (dir, tx, selected)
     }
 
@@ -994,7 +1040,7 @@ mod tests {
         let (dir, mut tx, selected) = superseded_fixture();
         assert_eq!(
             Transaction::load(dir.path()).unwrap().phase,
-            Phase::Applying
+            Phase::Restoring
         );
         // The verification is supplied by the live TLS+API probe in production.
         finish_superseded(dir.path(), &mut tx, &selected, Ok(())).unwrap();
@@ -1024,8 +1070,12 @@ mod tests {
         let guard = Guard::acquire(dir.path()).unwrap();
         assert!(admit_locked(dir.path(), &guard, requested_second()).is_err());
         drop(guard);
-        // Once the real systemd service has been repaired, the same identity
-        // can be verified without overwriting the valid external certificate.
+        // The next manual recovery reasserts ownership as Restoring before
+        // releasing the journal lock for the new HTTPS probe.
+        let guard = Guard::acquire(dir.path()).unwrap();
+        tx.phase = Phase::Restoring;
+        tx.save(dir.path(), &guard).unwrap();
+        drop(guard);
         finish_superseded(dir.path(), &mut tx, &selected, Ok(())).unwrap();
         assert_eq!(
             Transaction::load(dir.path()).unwrap().phase,
@@ -1052,6 +1102,66 @@ mod tests {
         assert_eq!(saved.phase, Phase::RecoveryFailed);
         assert!(saved.previous.is_some() && saved.requested.is_some());
         assert!(Selection::current(dir.path()).unwrap() == current);
+    }
+
+    #[test]
+    fn concurrent_manual_recoveries_have_one_exclusive_owner_and_release_on_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let first = Guard::try_recovery(dir.path()).unwrap();
+        let error = Guard::try_recovery(dir.path()).err().unwrap();
+        assert!(format!("{error:#}").contains("another recover-certificate process"));
+        // A recovery in another installation is independent of this one.
+        let _other = Guard::try_recovery(other_dir.path()).unwrap();
+        drop(first);
+        let _next = Guard::try_recovery(dir.path()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let lock = std::fs::metadata(dir.path().join(RECOVERY_LOCK_FILE)).unwrap();
+            assert_eq!(lock.permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn stale_manual_finalizer_cannot_overwrite_new_queued_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path());
+        let guard = Guard::acquire(dir.path()).unwrap();
+        let (mut first, _) = admit_locked(dir.path(), &guard, requested_second()).unwrap();
+        let old_snapshot: Transaction =
+            serde_json::from_slice(&serde_json::to_vec(&first).unwrap()).unwrap();
+        first.phase = Phase::Restoring;
+        first.save(dir.path(), &guard).unwrap();
+        let external = Selection::current(dir.path()).unwrap();
+        first
+            .finish(dir.path(), &guard, Phase::Recovered, "live HTTPS verified")
+            .unwrap();
+        let replacement = requested_for("third.example.test");
+        let (second, _) = admit_locked(dir.path(), &guard, replacement).unwrap();
+        assert_eq!(Transaction::load(dir.path()).unwrap().phase, Phase::Queued);
+        drop(guard);
+
+        // The original recovery's in-memory snapshot is now stale. TLS is
+        // still serving the same valid certificate, so certificate identity
+        // checking *alone* would incorrectly allow it to erase T2.
+        let mut stale = old_snapshot;
+        assert!(finish_superseded(dir.path(), &mut stale, &external, Ok(())).is_err());
+        assert!(
+            finish_superseded(
+                dir.path(),
+                &mut stale,
+                &external,
+                Err(anyhow::anyhow!("old HTTPS check failed"))
+            )
+            .is_err()
+        );
+        let current = Transaction::load(dir.path()).unwrap();
+        assert_eq!(current.phase, Phase::Queued);
+        assert!(current.previous == second.previous);
+        assert!(current.requested == second.requested);
+        assert!(current.detail.is_none());
+        assert!(Selection::current(dir.path()).unwrap() == external);
     }
 
     #[test]

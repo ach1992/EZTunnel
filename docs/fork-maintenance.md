@@ -76,6 +76,19 @@ remains in `RecoveryFailed` for a later `recover-certificate` retry; the worker
 tries a real restart and readiness check before deciding. Competing CLI/API
 requests get a clear already-active-transaction error; no global locking or
 operator-configurable concurrency ceiling is imposed.
+Manual `recover-certificate` also holds a **separate, per-state-directory,
+nonblocking `certificate-recovery.lock` for its entire operation**. Only one
+operator process may complete that same recovery; a concurrent attempt receives
+an explicit retryable error. Unlike the short transaction guard, this separate
+OS-owned lock can span systemd restart and HTTPS readiness and is automatically
+released when its process exits, including after an interruption. Under the
+short journal guard, recovery completion checks that its persisted Restoring
+transaction still owns the previous/requested selections before finalizing; a
+stale process cannot overwrite a new activation journal. Recovery resets a
+systemd unit only if it is actually failed; an inactive or unloaded unit is
+simply restarted, avoiding an unnecessary `reset-failed: Unit not loaded` error.
+Unrelated Dashboard instances and ordinary new activation/ACME operations are
+not globally blocked.
 The worker commits a complete key/chain/domain tuple,
 restarts the Dashboard and checks **both** the exact TLS certificate and the live
 `/api/session` response. If startup fails, it restores the previous tuple, resets a failed
@@ -96,9 +109,13 @@ processes** competing for the same activation journal, and superseding valid
 certificates during both healthy Dashboard service and failed replacement startup.
 The failed-startup case must retain the private recovery material, preserve the
 superseding certificate and demonstrate a later manual HTTPS-verified recovery.
+The test additionally launches two competing manual recovery CLI processes,
+checks that only one owns recovery, verifies that a later T2 activation journal
+remains intact, and kills a manual recovery mid-operation before retrying.
 Deterministic Rust tests cover renewal before admission, during queued/committed
 activation, external legacy renewal conflicts, retry after a rejected commit,
-HTTPS verification outcomes, and journal privacy. It neither orders real ACME certificates nor
+HTTPS verification outcomes, stale-finalizer rejection, recovery lock lifecycle,
+and journal privacy. It neither orders real ACME certificates nor
 changes Production or Agent/tunnel units.
 
 ## Local Fleet CLI endpoint selection

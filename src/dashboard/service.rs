@@ -64,9 +64,16 @@ pub fn restart() -> Result<()> {
     systemctl(&["restart", UNIT])
 }
 /// A failed replacement startup may trip systemd's start-limit before recovery.
-/// Always make a real start attempt rather than treating an inactive unit as success.
+/// Inactive/unloaded installed units cannot be reset, but can be restarted.
 pub(super) fn reset_failed() -> Result<()> {
-    systemctl(&["reset-failed", UNIT])
+    let failed = Command::new("systemctl")
+        .args(["is-failed", "--quiet", UNIT])
+        .status()
+        .context("check Dashboard systemd failed state")?;
+    if failed.success() {
+        systemctl(&["reset-failed", UNIT])?;
+    }
+    Ok(())
 }
 
 /// Stops the service and removes it. The settings stay unless the caller deletes them.
