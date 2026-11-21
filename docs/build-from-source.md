@@ -13,7 +13,7 @@ In the commands below, replace `VERSION` with the release you downloaded. Releas
 are validated with Rust 1.98.1;
 the manifest's 1.88 minimum has not been revalidated against every current native
 dependency. Cross-compiling musl requires a matching C/C++/header sysroot, not
-merely a Rust target installation. Build tools never need application signing keys.
+merely a Rust target installation. Build tools never need release credentials.
 
 Tested on Ubuntu and Debian. You need `eztunnel-VERSION-source.tar.gz` and the matching `SHA256SUMS`.
 

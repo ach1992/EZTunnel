@@ -38,7 +38,7 @@ With `transport: "tun"`, each IP packet is an independent encrypted datagram on 
 | `raw_tun.rs` | Authenticated unreliable IP datagrams and replay protection. |
 | `transport.rs` | Noise handshake, peer authorization, encrypted records. |
 | `session_crypto.rs` | Protocol domains, HKDF key separation and epoch thresholds. |
-| `release.rs` | Official update-file Ed25519 verification. |
+| `release.rs` | Official GitHub Release repository identity. |
 | `wire.rs` | Multiplexing frame encoding and validation. |
 | `stealth.rs` | Wire version 2: the masked start of plain streams, decoy replies and names derived from the key. |
 | `engine.rs` | Sessions, forwarding, flow control, reconnects, liveness, and replacing sessions that stop answering. |

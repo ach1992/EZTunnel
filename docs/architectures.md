@@ -17,7 +17,7 @@ Select the file matching `uname -m`. `x86_64`/`amd64` means x86-64;
 `aarch64`/`arm64` means ARM64. The installer checks the ELF architecture before
 executing or installing it. The updater also checks architecture, ELF class and
 byte order; an ARM64 executable cannot replace an x86-64 installation or vice
-versa. These checks are distinct from official-update signature verification.
+versa. These checks are distinct from GitHub Release SHA256SUMS verification.
 
 ## Ordinary Builds
 
