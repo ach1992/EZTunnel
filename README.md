@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ach1992/EZTunnel/releases"><img src="https://img.shields.io/badge/release-fork-00afff?style=for-the-badge" alt="Release v0.12.0"></a>
+  <a href="https://github.com/ach1992/EZTunnel/releases"><img src="https://img.shields.io/badge/release-fork-00afff?style=for-the-badge" alt="Release v0.12.0-ach.1"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-875fff?style=for-the-badge" alt="License: AGPL-3.0"></a>
   <img src="https://img.shields.io/badge/built_with-Rust-dea584?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust">
   <img src="https://img.shields.io/badge/Linux-x86__64%20%7C%20ARM64-0087ff?style=for-the-badge&logo=linux&logoColor=white" alt="Linux x86_64 and ARM64">
@@ -34,8 +34,9 @@ config files to write.
   per direction, and automatic session renewal.
 - **Flexible:** 15 transports, from plain TCP to WebSocket, CDN-friendly XHTTP,
   loss-resistant FEC and raw IPv4 carriers.
-- **Yours:** open source and self-hosted, with no telemetry. It only talks to the
-  servers you configure.
+- **Yours:** open source and self-hosted, with no routine telemetry. Tunnel traffic
+  goes to the peers and targets you configure; explicit Release downloads and optional
+  certificate issuance contact GitHub and your certificate authority.
 
 ## What's new in 0.12.0
 

@@ -25,7 +25,7 @@ publishes a versioned GitHub Release. Existing Releases/tags are never overwritt
 No separate signing key, Actions secret or manual bootstrap is needed.
 A manual workflow dispatch on a **non-main branch** builds test artifacts for
 both CPUs but skips publication. Only an authorized dispatch from reviewed
-\`main\` may publish a public Release. The native GNU/Linux build contract
+`main` may publish a public Release. The native GNU/Linux build contract
 and its GLIBC/runtime checks are documented in [architectures.md](architectures.md).
 
 
