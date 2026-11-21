@@ -2,54 +2,58 @@
 
 This repository remains a GitHub fork of [B3hnamR/EZTunnel](https://github.com/B3hnamR/EZTunnel) (AGPL-3.0-only). The separate fork main is the only branch used for our installers, official binaries and updates. The contributor PR at [upstream #2](https://github.com/B3hnamR/EZTunnel/pull/2) stays open and its contributor branch must not be reset or repurposed while the maintainer is reviewing it.
 
+This is a **temporary independent installation channel** while the upstream maintainer
+considers our changes. The intended outcome is a working, single-command fork
+installer and Release, not an ongoing custom signing or distribution system.
+Once a released upstream version contains the needed features and is verified
+on our servers, decide separately when to migrate or retire this fork. Do not
+silently switch the installer to upstream binaries before then.
+
+
 ## Synchronizing upstream
 
 The scheduled/manual **Propose upstream sync** workflow fetches upstream `main`, merges it into an isolated `sync/upstream-<sha>` branch and opens a PR **into our own fork main**. It does not push upstream, force-update main, integrate, publish, or deploy. A merge conflict fails visibly; a human resolves it in a task branch and re-tests rather than discarding either side. It leaves an already-open sync PR alone. Since PRs created with `GITHUB_TOKEN` do not trigger ordinary PR workflows, the sync workflow explicitly dispatches Fork CI for its branch.
 
-Before accepting a sync PR, verify the changes preserve the fork's Fleet CLI and Dashboard domain controls, fork-owned release/download/signing identity, the distinct package version, and committed generated UI assets. Run the required CI and obtain exact-diff independent review before integrating. For a manual sync use `git remote add upstream https://github.com/B3hnamR/EZTunnel.git`, `git fetch upstream main`, and `git merge --no-ff upstream/main` from a new branch based on fork main. Never `reset --hard` fork main to upstream.
+Before accepting a sync PR, verify the changes preserve the fork's Fleet CLI and Dashboard domain controls, fork-owned Release/download identity, the distinct package version, and committed generated UI assets. Run the required CI and obtain exact-diff independent review before integrating. For a manual sync use `git remote add upstream https://github.com/B3hnamR/EZTunnel.git`, `git fetch upstream main`, and `git merge --no-ff upstream/main` from a new branch based on fork main. Never `reset --hard` fork main to upstream.
 
-## Release authority and installation
+## Official Releases and installation
 
-This fork intentionally downloads only GitHub Releases from **ach1992/EZTunnel**, via `scripts/install-latest.sh`, Dashboard Maintenance and the auto-join bootstrap. The installed fork's program updater verifies an embedded **fork** Ed25519 release key (ID 1), not the upstream release key. An ordinary developer build with no `EZTUNNEL_RELEASE_PUBLIC_KEY_HEX` cannot authenticate files for updater installation; it can still run locally for development.
+The fork publishes only to `ach1992/EZTunnel`. The manual **Publish fork release**
+workflow runs from reviewed `main`, builds Linux x86_64 and ARM64 executables,
+packages `eztunnel-linux-<arch>.tar.gz` archives plus `SHA256SUMS`, and
+publishes a versioned GitHub Release. Existing Releases/tags are never overwritten.
+No separate signing key, Actions secret or manual bootstrap is needed.
+A manual workflow dispatch on a **non-main branch** builds test artifacts for
+both CPUs but skips publication. Only an authorized dispatch from reviewed
+\`main\` may publish a public Release. The native GNU/Linux build contract
+and its GLIBC/runtime checks are documented in [architectures.md](architectures.md).
 
-**A first fork release is blocked until the reviewed, non-secret public key pin is filled in.**
-The checked-in `.github/release-public-key.hex` initially contains `UNPROVISIONED`. After
-creating the seed, derive the matching 32-byte Ed25519 public key locally, submit that **public**
-hex (64 lowercase characters) as a reviewed change to the pin file, and only then release. The
-workflow refuses to publish if the Actions signing seed does not match that reviewed identity.
-Changing only the Actions secret can never silently replace the trusted key of installed clients.
-An intentional rotation requires a separately reviewed signed-bridge migration.
 
-**The release signing secret has not been provisioned automatically.** The Owner must securely generate an Ed25519 private seed locally/offline, keep a recoverable private backup, and set GitHub Actions repository secret `EZTUNNEL_RELEASE_KEY_HEX` (hex-encoded, 32 bytes). Never commit, publish, print into logs or chat, or include this secret in executable assets. One possible local setup using OpenSSL and GitHub CLI:
-
-```bash
-umask 077
-openssl genpkey -algorithm Ed25519 -out ./eztunnel-fork-release-key.pem
-openssl pkey -in ./eztunnel-fork-release-key.pem -outform DER |
-  tail -c 32 | od -An -tx1 -v | tr -d ' \n' |
-  gh secret set EZTUNNEL_RELEASE_KEY_HEX --repo ach1992/EZTunnel
-```
-
-Derive the public hex locally and put **only that public value** in
-`.github/release-public-key.hex` via a separately reviewed commit:
+Install on each Linux server with the same one-line experience as upstream:
 
 ```bash
-openssl pkey -in ./eztunnel-fork-release-key.pem -pubout -outform DER | \
-  tail -c 32 | od -An -tx1 -v | tr -d ' \n'
-```
-Run `bash scripts/test-release-public-key.sh` to verify a changed secret cannot pass the pin gate.
-
-Keep the private key file outside the repository. The manual **Publish signed fork release** workflow derives only the public key, embeds it when building x86_64/ARM64, signs the binaries in a final publisher job, verifies the signature before publication, creates matching release archives and `SHA256SUMS`, and publishes a versioned release. It must be run on `main` **after** independent review, successful tests and explicit release authorization. If the secret is absent, the workflow fails before release; do not silently substitute upstream binaries or unsigned builds. Do not rotate the trusted public key without a deliberate migration plan for the installed fork versions.
-
-For installation after a release exists:
-
-```bash
-curl -fsSLo install-eztunnel-fork.sh https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh
-sudo bash install-eztunnel-fork.sh --no-menu
-sudo eztunnel menu
+bash <(curl -fsSL https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh)
 ```
 
-The installer keeps a backup of an existing executable and does not restart tunnels. Dashboard/agent programs and running tunnel services must be validated on test machines before any production rollout.
+The installer downloads only from the **fork's** GitHub Releases. It validates
+HTTPS, SHA256SUMS, ELF architecture and the executable version, preserves
+the replaced binary and never restarts running tunnels. For a specific tag,
+use `--version v0.12.0-ach.1`. Dashboard official downloads use the same
+HTTPS/checksum model; Agent transfers use authenticated management channels
+and matching SHA256 checks. Manually uploaded programs are an explicitly
+administrator-trusted input, **not** independently authenticated releases.
+
+**Trust boundary:** SHA256SUMS detects corrupt or mismatched archives; it does not
+independently authenticate a publisher if the GitHub account serving both
+archives and checksums is compromised. This simplified fork does not claim a
+separate Ed25519 release-signing identity. Tunnel Noise authentication,
+stored keys and paired peer identities remain unchanged.
+
+Updates use private staging, persistent configuration validation and automatic
+rollback when a tunnel fails to recover. Manual rollback requires the exact
+previous executable whose SHA256 was recorded by the updater. The one-line
+installer keeps a separate `eztunnel.backup-<sha256>` when replacing a program
+and does not change running services until explicitly restarted.
 
 ## Dashboard domain
 

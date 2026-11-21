@@ -39,6 +39,6 @@ jobs:
             exit 1
           fi
           git push origin "HEAD:refs/heads/$branch"
-          gh pr create --base main --head "$branch" --title "chore: merge upstream EZTunnel $sha" --body "Merge proposal for upstream B3hnamR/EZTunnel main commit $(git rev-parse upstream/main). Check domain control, Fleet CLI, update source/signing key, Cargo version and generated dashboard assets. Never auto-merge or auto-release."
+          gh pr create --base main --head "$branch" --title "chore: merge upstream EZTunnel $sha" --body "Merge proposal for upstream B3hnamR/EZTunnel main commit $(git rev-parse upstream/main). Check domain control, Fleet CLI, update source/release workflow, Cargo version and generated dashboard assets. Never auto-merge or auto-release."
           # GITHUB_TOKEN-created PRs and pushes do not trigger other workflows.
           gh workflow run ci.yml --ref "$branch"

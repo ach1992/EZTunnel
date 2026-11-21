@@ -1678,7 +1678,8 @@ async fn release_fetch(State(state): State<Arc<AppState>>, request: Request) -> 
     }
 }
 
-/// A program file sent from the browser: kept only when it carries the official signature.
+/// A signed-in administrator can stage an ELF upload without executing it.
+/// Installation is a separate authenticated action and trusts this selected file.
 async fn release_upload(State(state): State<Arc<AppState>>, request: Request) -> Response {
     if !state.signed_in(request.headers()) {
         return unauthorized();

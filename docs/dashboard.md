@@ -237,15 +237,16 @@ in the Dashboard/Agent architecture is not magically implemented by exposing a C
 | Health | A score for every server at once; open one for its checks (time sync, network tuning, UDP buffers, memory, disk, firewall, tunnel files and services) and fix what it can with one click. |
 | Connection test | The transport checker between two servers ([checker](checker.md)): **Find transports** (every transport with its defaults) or **Tune transports** (the chosen ones with every option they have, in rounds), each with a depth preset or **Custom** (transports, raw TUN packet types, measurements, extra checks, rounds and ports chosen by hand). Find results offer **Tune the best 3**; tune results list every transport's options best first. A tunnel is created from any result with its tested option; the path finder (can the two servers reach each other, over IPv4 and, when both have one, IPv6; what the Iran server reaches abroad; which other server could relay); and the Mirage source test ([Mirage](mirage.md)), whose results can be filtered, sorted, copied and saved as CSV or JSON. |
 | Logs | Any tunnel's log, live, with level filter, search, copy and download; and the dashboard's own activity log (sign-ins, every action). |
-| Maintenance | The EZTunnel version on each server. **Update** brings a server to the newest official release: the dashboard knows each server's CPU and downloads and checks the right file itself. **Update all** does every server in turn and stops at the first one that fails. A program file can also be uploaded (only officially signed files are accepted) and installed on one server or on all of them in turn (the first one as a canary), or a server rolled back. Back up every server's tunnels now or on a schedule, and restore a kept backup, or a backup file, on any server. A restore starts the tunnels it adds; with **Replace**, tunnels that were running restart with the restored settings and stopped ones stay stopped. |
+| Maintenance | The EZTunnel version on each server. **Update** brings a server to the newest official release: the dashboard knows each server's CPU and downloads and checks the right file itself. **Update all** does every server in turn and stops at the first one that fails. An administrator can also upload a program file (verify its source and SHA256) and install it on one server or on all of them in turn (the first one as a canary), or a server rolled back. Back up every server's tunnels now or on a schedule, and restore a kept backup, or a backup file, on any server. A restore starts the tunnels it adds; with **Replace**, tunnels that were running restart with the restored settings and stopped ones stay stopped. |
 | Alerts | Problems found now (a tunnel down, high loss, steady UDP drops, a traffic limit reached, a server offline, low disk) and their history. |
 | Settings | Language and theme, password and signed-in sessions, Telegram alerts, a proxy for downloads and Telegram, and a metrics endpoint. |
 
-Installing a new version uses each server's own updater: it accepts only officially signed
-EZTunnel programs, keeps the old program, restarts that server's tunnels one by one and goes back by
-itself if one does not stay up. The updater replaces only a program that is itself a signed release: a
-server still on v0.9.14 or older moves to v0.10.0 once with the installer. Backups contain the tunnel keys; keep downloaded backup files
-private.
+Installing a new version uses each server's own updater. Official releases are
+downloaded over HTTPS and checked against the fork's published SHA256SUMS.
+Uploads are explicitly administrator-selected programs, with source and SHA256
+shown for manual checking. The updater keeps the old executable, restarts
+running tunnels and automatically restores the previous program if a tunnel
+fails to recover. Backups contain tunnel keys; keep downloaded files private.
 
 ## Telegram alerts
 

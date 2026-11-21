@@ -1,4 +1,4 @@
-> **ACh-maintained fork.** We maintain our Fleet CLI/Menu and Dashboard domain controls while the [upstream contribution](https://github.com/B3hnamR/EZTunnel/pull/2) remains under review. Fork releases, installers and program updates come exclusively from [ach1992/EZTunnel](https://github.com/ach1992/EZTunnel). See [fork maintenance](docs/fork-maintenance.md) for upstream sync, release verification and signing prerequisites. Original upstream attribution is preserved below. Do not run the upstream installer to update a fork installation.
+> **ACh-maintained fork.** We maintain our Fleet CLI/Menu and Dashboard domain controls while the [upstream contribution](https://github.com/B3hnamR/EZTunnel/pull/2) remains under review. Fork releases, installers and program updates come exclusively from [ach1992/EZTunnel](https://github.com/ach1992/EZTunnel). See [fork maintenance](docs/fork-maintenance.md) for upstream sync, release downloads and maintenance procedures. Original upstream attribution is preserved below. Do not run the upstream installer to update a fork installation.
 
 <p align="center">
   <img src="docs/assets/banner.svg?v=0.12.0" alt="EZTunnel: encrypted tunnels, made simple" width="100%">
@@ -81,7 +81,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ach1992/EZTunnel/main/script
 
 The installer picks the right build for your CPU (x86_64 or ARM64), checks it
 against the release's `SHA256SUMS`, installs `/usr/local/bin/eztunnel` and then opens the manager. It
-never starts, stops or changes existing tunnels.
+never starts, stops or changes existing tunnels. The fork's official binaries target
+GNU/Linux with glibc 2.39 and standard Ubuntu 24.04 shared libraries;
+they are not static musl builds. See [Linux architectures](docs/architectures.md).
 
 <details>
 <summary><b>Prefer to read the installer first, or pin a version?</b></summary>
@@ -90,7 +92,7 @@ never starts, stops or changes existing tunnels.
 curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh
 less install-eztunnel.sh
 sudo bash install-eztunnel.sh                      # latest release
-sudo bash install-eztunnel.sh --version v0.12.0    # a specific release
+sudo bash install-eztunnel.sh --version v0.12.0-ach.1  # a specific fork release
 sudo bash install-eztunnel.sh --no-menu            # install only, do not open the manager
 ```
 
@@ -596,7 +598,7 @@ Examples are in [`examples/`](examples/); every field is described in the
 <summary><b>Build on Linux or WSL</b></summary>
 
 ```bash
-git clone https://github.com/B3hnamR/EZTunnel.git
+git clone https://github.com/ach1992/EZTunnel.git
 cd EZTunnel
 cargo build --locked --release
 cargo test --locked --release --all-targets
@@ -606,7 +608,7 @@ The default build includes browser-compatible TLS and needs a C/C++ toolchain, C
 and libclang. `--no-default-features` builds without browser TLS (not full feature
 parity). Releases are validated with Rust 1.98.1.
 
-Static release builds:
+Optional static-musl source builds (not the fork's official GitHub Release assets):
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
