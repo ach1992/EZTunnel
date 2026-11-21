@@ -135,7 +135,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
 /// Largest program file accepted (the real one is a few MiB).
 const MAX_PROGRAM_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Reads a program file once. Everything after this (the signature check, the version probe,
+/// Reads a program file once. Everything after this (the version probe,
 /// the installation) works from these bytes or from a private copy of them, never from the
 /// path again: a file in a user-writable directory can be swapped between two opens.
 fn read_program(path: &Path) -> Result<Vec<u8>> {

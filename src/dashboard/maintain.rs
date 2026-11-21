@@ -58,11 +58,12 @@ pub fn latest(proxy: Option<&str>) -> Result<Value> {
 }
 
 fn elf_machine(bytes: &[u8]) -> Option<u16> {
-    (bytes.len() > 20 && bytes[..4] == *b"\x7fELF").then(|| u16::from_le_bytes([bytes[18], bytes[19]]))
+    (bytes.len() >= 64 && bytes[..6] == *b"\x7fELF\x02\x01" && bytes[6] == 1)
+        .then(|| u16::from_le_bytes([bytes[18], bytes[19]]))
 }
 
-/// Downloads a release for one CPU type, checks the archive against SHA256SUMS, takes the
-/// program out of it, checks its CPU and its release signature, and keeps it in `dir`.
+/// Downloads the fork's HTTPS release for one CPU type, checks SHA256SUMS,
+/// extracts only the documented program, checks its CPU and keeps it in `dir`. 
 pub fn fetch(version: &str, arch: &str, dir: &Path, proxy: Option<&str>) -> Result<Value> {
     ensure!(version_ok(version), "a version looks like 0.9.14 (or latest)");
     let machine = match arch {
@@ -120,7 +121,9 @@ pub fn keep(bytes: &[u8], dir: &Path) -> Result<Value> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.bin", &sum[..16]));
     write_private(&path, bytes)?;
-    let version = probe_version(&path, arch).unwrap_or_default();
+    // Caching an uploaded executable must not execute it before installation approval.
+    // A verified GitHub fetch records its release version separately.
+    let version = String::new();
     let meta = json!({"file": path.file_name().unwrap().to_string_lossy(), "sha256": sum, "arch": arch, "version": version, "size": bytes.len(), "added": super::now()});
     write_private(&path.with_extension("json"), serde_json::to_string(&meta)?.as_bytes())?;
     Ok(meta)
@@ -177,24 +180,6 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
-}
-
-/// The version a signed program reports, when it runs on this CPU.
-fn probe_version(path: &Path, arch: &str) -> Option<String> {
-    if arch != std::env::consts::ARCH {
-        return None;
-    }
-    let work = WorkDir::new(path.parent()?).ok()?;
-    let copy = work.0.join("eztunnel");
-    std::fs::copy(path, &copy).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o700)).ok()?;
-    }
-    let out = Command::new(&copy).arg("--version").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.trim().strip_prefix("eztunnel ").map(str::to_string)
 }
 
 /// The programs kept on the dashboard's server, newest first.
@@ -410,14 +395,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unsigned_or_foreign_programs_are_not_kept() {
+    fn malformed_programs_are_rejected_without_executing_uploads() {
         let dir = tempfile::tempdir().unwrap();
         assert!(keep(b"#!/bin/sh\necho hi\n", dir.path()).is_err(), "not a program");
         let mut elf = vec![0u8; 64];
-        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[6] = 1;
         elf[18] = 62;
-        assert!(keep(&elf, dir.path()).is_err(), "unsigned");
-        assert!(kept(dir.path()).is_empty());
+        let metadata = keep(&elf, dir.path()).unwrap();
+        assert_eq!(metadata["version"], ""); // Upload was never executed.
+        assert_eq!(kept(dir.path()).len(), 1);
         for bad in ["../etc/passwd", "0123456789abcdef.json", "zz23456789abcdef.bin"] {
             assert!(read_kept(dir.path(), bad).is_err(), "{bad}");
         }
