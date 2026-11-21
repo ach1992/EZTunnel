@@ -90,7 +90,7 @@ never starts, stops or changes existing tunnels.
 curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh
 less install-eztunnel.sh
 sudo bash install-eztunnel.sh                      # latest release
-sudo bash install-eztunnel.sh --version v0.12.0    # a specific release
+sudo bash install-eztunnel.sh --version v0.12.0-ach.1  # a specific fork release
 sudo bash install-eztunnel.sh --no-menu            # install only, do not open the manager
 ```
 
@@ -596,7 +596,7 @@ Examples are in [`examples/`](examples/); every field is described in the
 <summary><b>Build on Linux or WSL</b></summary>
 
 ```bash
-git clone https://github.com/B3hnamR/EZTunnel.git
+git clone https://github.com/ach1992/EZTunnel.git
 cd EZTunnel
 cargo build --locked --release
 cargo test --locked --release --all-targets

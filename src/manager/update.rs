@@ -1372,7 +1372,10 @@ mod tests {
     fn a_tunnel_that_does_not_stay_up_undoes_the_update() {
         let (_directory, target, new) = setup("0.7.0", "0.7.1");
         // An earlier update left 0.6.2 as the previous program; a failed update must not lose it.
-        std::fs::write(previous_path(&target), program("0.6.2", "body-earlier")).unwrap();
+        let earlier_program = program("0.6.2", "body-earlier");
+        std::fs::write(previous_path(&target), &earlier_program).unwrap();
+        record_previous(&target);
+        let earlier_hash = std::fs::read_to_string(previous_hash_path(&target)).unwrap();
         let mut host = fake(&target, &["alpha", "beta"]);
         host.broken_with.insert("beta".into(), "0.7.1".into());
         let outcome = perform(&host, &new, &target, &NORMAL).unwrap();
@@ -1384,6 +1387,9 @@ mod tests {
         );
         assert!(has_version(&target, "0.7.0"));
         assert!(has_version(&previous_path(&target), "0.6.2"));
+        assert_eq!(std::fs::read(previous_path(&target)).unwrap(), earlier_program);
+        assert_eq!(std::fs::read_to_string(previous_hash_path(&target)).unwrap(), earlier_hash);
+        ensure_rollback_trusted(&target, &earlier_program).unwrap();
         assert!(!keep_path(&previous_path(&target)).exists());
         // Restarted for the update, then again for the way back.
         assert_eq!(*host.restarts.borrow(), ["alpha", "beta", "alpha", "beta"]);

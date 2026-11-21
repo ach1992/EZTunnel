@@ -63,7 +63,7 @@ fn elf_machine(bytes: &[u8]) -> Option<u16> {
 }
 
 /// Downloads the fork's HTTPS release for one CPU type, checks SHA256SUMS,
-/// extracts only the documented program, checks its CPU and keeps it in `dir`. 
+/// extracts only the documented program, checks its CPU and keeps it in `dir`.
 pub fn fetch(version: &str, arch: &str, dir: &Path, proxy: Option<&str>) -> Result<Value> {
     ensure!(version_ok(version), "a version looks like 0.9.14 (or latest)");
     let machine = match arch {
