@@ -46,6 +46,13 @@ const ALL: &str = "*";
 /// How long a signed-in browser may take to upload a file.
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(15 * 60);
 
+#[derive(Default, Clone)]
+pub struct CertificateTask {
+    pub running: bool,
+    pub error: Option<String>,
+    pub address: Option<String>,
+}
+
 pub struct AppState {
     pub history: Arc<super::history::History>,
     pub auth: auth::Auth,
@@ -64,6 +71,7 @@ pub struct AppState {
     pub agent_slots: Arc<Semaphore>,
     /// The certificate being served (HTTPS only): join commands pin its key.
     pub cert: Option<Arc<super::tls::Swap>>,
+    pub certificate_task: Mutex<CertificateTask>,
     pub demo: bool,
     /// HTTPS: cookies are marked Secure and carry the __Host- prefix.
     pub secure: bool,
@@ -152,6 +160,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/alerts", get(alerts_list))
         .route("/api/alerts/test", post(alerts_test))
         .route("/api/settings", get(settings_get).post(settings_set))
+        .route("/api/dashboard/certificate", get(certificate_status).post(certificate_set))
         .route("/api/password", post(password_set))
         .route("/api/sessions", get(sessions_list))
         .route("/api/sessions/revoke", post(sessions_revoke))
@@ -461,6 +470,36 @@ async fn tunnel_names(state: &Arc<AppState>) -> Vec<String> {
     tokio::task::spawn_blocking(move || ops.names()).await.unwrap_or_default()
 }
 
+/// Use a distinct action-name variant on the EXISTING URL so an older Hub
+/// also fails closed (its legacy parse_action rejects paired-start/stop/restart).
+fn action_route(word: &str) -> Option<(crate::manager::bulk::Action, bool)> {
+    if let Some(legacy) = ops::parse_action(word) {
+        return Some((legacy, false));
+    }
+    word.strip_prefix("paired-")
+        .and_then(ops::parse_action)
+        .map(|action| (action, true))
+}
+
+/// A guarded lifecycle request uses the existing action URL, with an expected pair
+/// identity checked atomically inside the target Agent (or LocalOps) store lock.
+async fn action_pair_guard(request: Request) -> Result<Option<String>, Response> {
+    let bytes = read_body(request, MAX_BODY).await?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "bad_request"))?;
+    if !body.is_object() {
+        return Err(error(StatusCode::BAD_REQUEST, "bad_request"));
+    }
+    match body.get("expect_pair") {
+        None => Ok(None),
+        Some(Value::String(pair)) if ops::valid_pair(pair) => Ok(Some(pair.to_ascii_lowercase())),
+        _ => Err(error(StatusCode::BAD_REQUEST, "invalid_pair")),
+    }
+}
+
 /// Start, stop or restart one tunnel. Answers when the action is done; after a start it also
 /// says whether the tunnel came up and stayed up.
 async fn act(
@@ -472,11 +511,18 @@ async fn act(
         return unauthorized();
     }
     let ip = client_ip(&request);
-    let Some(action) = ops::parse_action(&action) else {
+    let Some((action, paired)) = action_route(&action) else {
         return error(StatusCode::NOT_FOUND, "unknown_action");
     };
     if !tunnel_names(&state).await.contains(&name) {
         return error(StatusCode::NOT_FOUND, "unknown_tunnel");
+    }
+    let expected_pair = match action_pair_guard(request).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if expected_pair.is_some() != paired {
+        return error(StatusCode::BAD_REQUEST, "invalid_pair");
     }
     let Some(busy) = Busy::take(&state, vec![name.clone()]) else {
         return error(StatusCode::CONFLICT, "busy");
@@ -489,7 +535,10 @@ async fn act(
     // until the action really ends.
     let task = tokio::task::spawn_blocking(move || {
         let _busy = busy;
-        ops.act(&task_name, action)
+        match expected_pair {
+            Some(pair) => ops.act_pair(&task_name, action, &pair),
+            None => ops.act(&task_name, action),
+        }
     });
     let answer = tokio::time::timeout(ACTION_TIMEOUT, task).await;
     state.live.refresh();
@@ -853,10 +902,20 @@ async fn server_act(
         return unauthorized();
     }
     let ip = client_ip(&request);
-    let Some(action) = ops::parse_action(&action) else {
+    let Some((action, paired)) = action_route(&action) else {
         return error(StatusCode::NOT_FOUND, "unknown_action");
     };
+    let expected_pair = match action_pair_guard(request).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if expected_pair.is_some() != paired {
+        return error(StatusCode::BAD_REQUEST, "invalid_pair");
+    }
     let Some(fleet) = state.fleet.clone() else {
+        if expected_pair.is_some() {
+            return error(StatusCode::BAD_GATEWAY, "remote_offline");
+        }
         tokio::time::sleep(Duration::from_millis(700)).await;
         return Json(json!({"ok": true, "changed": true, "came_up": (action != crate::manager::bulk::Action::Stop).then_some(true)})).into_response();
     };
@@ -868,7 +927,10 @@ async fn server_act(
     };
     let word = ops::action_word(action);
     state.audit.record(ip, "action", &format!("{word} {name} on {id}"));
-    let answer = fleet.request_held(&id, json!({"op": "act", "name": name, "action": word}), ACTION_TIMEOUT, busy.clone()).await;
+    let answer = fleet.request_held(&id,
+        json!({"op": if expected_pair.is_some() { "act_pair" } else { "act" },
+            "name": name, "action": word, "expect_pair": expected_pair}),
+        ACTION_TIMEOUT, busy.clone()).await;
     drop(busy);
     match answer {
         Ok(outcome) => Json(json!({"ok": true, "changed": outcome["changed"], "came_up": outcome["came_up"]})).into_response(),
@@ -1340,13 +1402,108 @@ async fn settings_get(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
         return unauthorized();
     }
     let prefs = super::prefs::load(&state.state_dir);
-    let cert = state.cert.as_ref().map(|c| json!({"not_after": c.not_after(), "lets_encrypt": state.state_dir.join("acme-chain.pem").exists()}));
+    let configured_certificate = super::load_settings(&state.state_dir).ok().and_then(|s| s.acme);
+    let cert = state.cert.as_ref().map(|c| json!({"not_after": c.not_after(), "lets_encrypt": configured_certificate.is_some()}));
     Json(json!({
         "prefs": super::prefs::shown(&prefs),
         "telegram_last": super::alerts::last_delivery(&state.state_dir),
-        "panel": {"address": state.public.0, "port": state.public.1, "https": state.secure, "cert": cert, "version": env!("CARGO_PKG_VERSION"), "state_dir": state.state_dir.display().to_string()},
+        "panel": {"address": state.public.0, "port": state.public.1, "https": state.secure, "cert": cert, "certificate_address": configured_certificate.map(|s| s.address), "version": env!("CARGO_PKG_VERSION"), "state_dir": state.state_dir.display().to_string()},
     }))
     .into_response()
+}
+
+/// Whether the live TLS resolver presents the certificate currently configured on disk.
+/// A manual `dashboard serve --no-service` does not restart by systemd, so a saved
+/// setting must never be mistaken for a certificate already active in this process.
+pub(super) fn certificate_is_active(state_dir: &std::path::Path, swap: Option<&super::tls::Swap>) -> Option<bool> {
+    let current = swap?.current();
+    let actual = current.cert.first()?.as_ref();
+    let configured = super::load_settings(state_dir).ok()?;
+    let expected = match configured.acme.as_ref() {
+        Some(wanted) => {
+            let issued = super::acme::load_for(state_dir, wanted)?;
+            let (_, until) = issued.validity().ok()?;
+            if until <= super::now() { return Some(false); }
+            issued.chain.first()?.as_ref().to_vec()
+        },
+        None => super::tls::self_signed_der(state_dir)?,
+    };
+    Some(actual == expected)
+}
+
+/// Configuring a domain may take several minutes (ACME HTTP-01). Keep the HTTP request
+/// short and expose progress/errors without risking a client timeout during the order.
+async fn certificate_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !state.signed_in(&headers) { return unauthorized(); }
+    let task = state.certificate_task.lock().unwrap().clone();
+    let recorded = super::activation::status(&state.state_dir);
+    let worker_running = recorded.as_ref().is_some_and(|(running, _, _)| *running);
+    let phase = recorded.as_ref().and_then(|(_, _, phase)| phase.as_deref());
+    let message = recorded.as_ref().and_then(|(_, message, _)| message.clone());
+    let error = task.error.or_else(|| match phase {
+        Some("recovered" | "recovery_failed" | "failed" | "queued" | "applying" | "restoring") if !worker_running => message.clone(),
+        _ => None,
+    });
+    let active = certificate_is_active(&state.state_dir, state.cert.as_deref());
+    let configured_address = super::load_settings(&state.state_dir).ok()
+        .and_then(|settings| settings.acme.map(|wanted| wanted.address));
+    Json(json!({
+        "running": task.running || worker_running,
+        "error": error,
+        "phase": phase,
+        "message": message,
+        "address": task.address,
+        "configured_address": configured_address,
+        "active": active == Some(true),
+        "restart_required": phase == Some("restart_required") || (active == Some(false) && !task.running && !worker_running),
+    })).into_response()
+}
+
+async fn certificate_set(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if !state.signed_in(request.headers()) { return unauthorized(); }
+    if state.demo { return failed_with(StatusCode::BAD_REQUEST, "the demo cannot change certificates"); }
+    let ip = client_ip(&request);
+    let form = match read_json(request).await {
+        Ok(form) => form,
+        Err(response) => return response,
+    };
+    let (letsencrypt, address) = match form["mode"].as_str() {
+        Some("lets_encrypt") => {
+            let Some(domain) = form["address"].as_str() else {
+                return failed_with(StatusCode::BAD_REQUEST, "enter a domain name or IP address");
+            };
+            match super::certificate_address(domain) {
+                Ok(value) => (true, Some(value)),
+                Err(error) => return failed_with(StatusCode::BAD_REQUEST, format!("{error:#}")),
+            }
+        }
+        Some("self_signed") => (false, None),
+        _ => return failed_with(StatusCode::BAD_REQUEST, "mode must be lets_encrypt or self_signed"),
+    };
+    {
+        let mut task = state.certificate_task.lock().unwrap();
+        if task.running { return failed_with(StatusCode::CONFLICT, "a certificate change is already running"); }
+        *task = CertificateTask { running: true, error: None, address: address.clone() };
+    }
+    let next_address = address.clone().unwrap_or_else(super::shown_address);
+    let url = format!("https://{}:{}", if next_address.contains(':') { format!("[{next_address}]") } else { next_address.clone() }, state.public.1);
+    state.audit.record(ip, "action", &format!("configure dashboard certificate for {next_address}"));
+    tokio::spawn(async move {
+        // ACME issuance may run in this process, but activation/restart and rollback
+        // run in a separately supervised systemd transient unit. The next server
+        // instance reads durable progress rather than trusting this in-memory task.
+        let result = super::certificate(&state.state_dir, letsencrypt, false, address).await;
+        let mut task = state.certificate_task.lock().unwrap();
+        task.running = false;
+        if let Err(error) = result {
+            let detail = format!("{error:#}");
+            state.audit.record(ip, "certificate_failed", &detail);
+            task.error = Some(detail);
+        } else {
+            state.audit.record(ip, "certificate", "certificate saved or activation dispatched; check persisted activation outcome");
+        }
+    });
+    (StatusCode::ACCEPTED, Json(json!({"started": true, "url": url}))).into_response()
 }
 
 async fn settings_set(State(state): State<Arc<AppState>>, request: Request) -> Response {
@@ -1521,7 +1678,8 @@ async fn release_fetch(State(state): State<Arc<AppState>>, request: Request) -> 
     }
 }
 
-/// A program file sent from the browser: kept only when it carries the official signature.
+/// A signed-in administrator can stage an ELF upload without executing it.
+/// Installation is a separate authenticated action and trusts this selected file.
 async fn release_upload(State(state): State<Arc<AppState>>, request: Request) -> Response {
     if !state.signed_in(request.headers()) {
         return unauthorized();
@@ -2364,7 +2522,12 @@ async fn new_tunnel_owned(State(state): State<Arc<AppState>>, request: Request) 
 }
 
 /// Deletes a tunnel here or on a joined server.
-async fn delete_answer(state: Arc<AppState>, server: String, name: String, request: Request) -> Response {
+async fn delete_answer(
+    state: Arc<AppState>,
+    server: String,
+    name: String,
+    request: Request,
+) -> Response {
     if !state.signed_in(request.headers()) {
         return unauthorized();
     }
@@ -2384,15 +2547,25 @@ async fn delete_answer(state: Arc<AppState>, server: String, name: String, reque
         Err(response) => return response,
     };
     let local = server == "local";
-    let key = if local { name.clone() } else { format!("{server}/{name}") };
+    let key = if local {
+        name.clone()
+    } else {
+        format!("{server}/{name}")
+    };
     if !local && state.busy.lock().unwrap().contains(&format!("{server}/*")) {
         return error(StatusCode::CONFLICT, "busy");
     }
     let Some(busy) = Busy::take(&state, vec![key]) else {
         return error(StatusCode::CONFLICT, "busy");
     };
-    let place = if local { String::new() } else { format!(" on {server}") };
-    state.audit.record(ip, "action", &format!("delete {name}{place}"));
+    let place = if local {
+        String::new()
+    } else {
+        format!(" on {server}")
+    };
+    state
+        .audit
+        .record(ip, "action", &format!("delete {name}{place}"));
     let answer: Result<()> = if local {
         let ops = state.ops.clone();
         let task_name = name.clone();
@@ -2414,8 +2587,12 @@ async fn delete_answer(state: Arc<AppState>, server: String, name: String, reque
         let Some(fleet) = state.fleet.clone() else {
             return error(StatusCode::NOT_FOUND, "unknown_server");
         };
-        // An agent from before `expect_pair` ignores it and deletes by name, as it always did.
-        let answer = fleet.request_held(&server, json!({"op": "delete", "name": name, "expect_pair": pair}), ACTION_TIMEOUT, busy.clone()).await.map(|_| ());
+        // Guarded removal is an explicit Agent operation: older Agents without it reject
+        // the request rather than ignore a fingerprint and delete a replacement tunnel.
+        let op = if pair.is_some() { "delete_pair" } else { "delete" };
+        let answer = fleet.request_held(&server,
+            json!({"op": op, "name": name, "expect_pair": pair}),
+            ACTION_TIMEOUT, busy.clone()).await.map(|_| ());
         drop(busy);
         answer
     };
@@ -2700,6 +2877,7 @@ mod tests {
             public: ("203.0.113.10".into(), 38_471),
             agent_slots: Arc::new(Semaphore::new(4)),
             cert: None,
+            certificate_task: Default::default(),
             demo: true,
             secure: false,
             state_dir: std::env::temp_dir().join(format!("ezd-test-{}-{:?}", std::process::id(), std::thread::current().id()).replace(['(', ')'], "")),
@@ -2798,6 +2976,62 @@ mod tests {
         waiting.as_mut().enable();
         PATH_CANCEL.notify_waiters();
         tokio::time::timeout(Duration::from_secs(1), waiting).await.expect("Cancel reaches the search");
+    }
+
+    /// An authenticated API on a manually served dashboard reports that persistence
+    /// alone does not activate TLS. It reports active only after the presented pair
+    /// changes, just as a stop/start of `dashboard serve --no-service` would do.
+    #[tokio::test]
+    async fn manual_dashboard_certificate_status_distinguishes_saved_from_active() {
+        let (initial, mut state) = app().await;
+        drop(initial);
+        let dir = tempfile::tempdir().unwrap();
+        let swap = Arc::new(super::super::tls::Swap::self_signed(dir.path(), "127.0.0.1").unwrap());
+        super::super::save_settings(dir.path(), &super::super::Settings {
+            version: 1, port: 33001, password_hash: "unused".into(), created: 1,
+            acme: None, acme_certificate: None,
+        }).unwrap();
+        let configure = Arc::get_mut(&mut state).unwrap();
+        configure.cert = Some(swap.clone());
+        configure.state_dir = dir.path().to_path_buf();
+        configure.demo = false;
+        configure.secure = true;
+        let app = router(state);
+        let cookie = signed_in(&app).await;
+        let status = |cookie: &String| with_cookie(hyper::Request::get("/api/dashboard/certificate").body(Body::empty()).unwrap(), cookie);
+        let before = json_of(call(&app, status(&cookie)).await).await;
+        assert_eq!((before["active"].as_bool(), before["restart_required"].as_bool()), (Some(true), Some(false)));
+
+        let rcgen::CertifiedKey { cert, key_pair } = rcgen::generate_simple_self_signed(vec!["panel.example.com".into()]).unwrap();
+        let issued = super::super::acme::Issued {
+            chain: vec![rustls::pki_types::CertificateDer::from(cert.der().as_ref().to_vec())],
+            key: rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+        };
+        let wanted = super::super::acme::AcmeSettings { address: "panel.example.com".into(), staging: false };
+        super::super::change_certificate_settings(dir.path(), Some((wanted, &issued))).unwrap();
+        let pending = json_of(call(&app, status(&cookie)).await).await;
+        assert_eq!(pending["configured_address"], "panel.example.com");
+        assert_eq!((pending["active"].as_bool(), pending["restart_required"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(swap.current().cert[0].as_ref(), super::super::tls::self_signed_der(dir.path()).unwrap(), "manual process still presents old TLS");
+
+        assert!(super::super::acme::install_stored(dir.path(), &swap).is_some());
+        let active = json_of(call(&app, status(&cookie)).await).await;
+        assert_eq!((active["active"].as_bool(), active["restart_required"].as_bool()), (Some(true), Some(false)));
+    }
+
+    /// Domain controls are not public and the demo never mutates host TLS state.
+    #[tokio::test]
+    async fn dashboard_certificate_controls_need_a_session_and_refuse_demo_changes() {
+        let (app, _) = app().await;
+        let path = "/api/dashboard/certificate";
+        let anon = call(&app, hyper::Request::get(path).body(Body::empty()).unwrap()).await;
+        assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(call(&app, post(path, r#"{"mode":"lets_encrypt","address":"test.example.com"}"#, true)).await.status(), StatusCode::UNAUTHORIZED);
+        let cookie = signed_in(&app).await;
+        let status = json_of(call(&app, with_cookie(hyper::Request::get(path).body(Body::empty()).unwrap(), &cookie)).await).await;
+        assert_eq!(status["running"], false);
+        assert_eq!(status["error"], Value::Null);
+        assert_eq!(call(&app, with_cookie(post(path, r#"{"mode":"lets_encrypt","address":"test.example.com"}"#, true), &cookie)).await.status(), StatusCode::BAD_REQUEST);
     }
 
     /// Only safe display names are kept; empty means the server's own name again.

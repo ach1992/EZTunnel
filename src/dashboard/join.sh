@@ -8,7 +8,7 @@
 set -euo pipefail
 umask 077
 
-installer=https://raw.githubusercontent.com/B3hnamR/EZTunnel/main/scripts/install-latest.sh
+installer=https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh
 installed=/usr/local/bin/eztunnel
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }

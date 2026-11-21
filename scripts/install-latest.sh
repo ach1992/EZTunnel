@@ -4,7 +4,7 @@
 set -euo pipefail
 umask 077
 
-repository=B3hnamR/EZTunnel
+repository=ach1992/EZTunnel
 prefix=/usr/local
 version=latest
 open_menu=1
@@ -15,9 +15,9 @@ usage() {
 EZTunnel GitHub Release installer
 Usage: sudo bash install-latest.sh [--version v0.9.12] [--prefix /usr/local] [--no-menu]
 
-Downloads the matching Linux archive and SHA256SUMS from B3hnamR/EZTunnel.
+Downloads the matching Linux archive and SHA256SUMS from ach1992/EZTunnel.
 Verifies the archive checksum and ELF CPU before executing the binary.
-Preserves a replaced executable, installs atomically, and never starts services.
+Preserves a replaced executable, installs atomically, and restarts active Dashboard/Agent services after updates.
 Latest means GitHub's latest published non-prerelease, not the newest source tag.
 Run from a terminal as root, it opens the manager when done; --no-menu (or
 EZTUNNEL_NO_MENU=1) only installs.

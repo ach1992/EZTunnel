@@ -1,0 +1,121 @@
+name: Publish fork release
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: eztunnel-fork-release
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - name: Read release version
+        id: meta
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "eztunnel") | .version')
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install native TLS build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config g++ binutils
+      - run: npm ci && npm run build
+        working-directory: dashboard-ui
+      - run: git diff --exit-code -- src/dashboard/ui/
+      - name: Build full-featured fork
+        run: cargo build --locked --profile dist --bin eztunnel
+      - run: test "$(./target/dist/eztunnel --version)" = "eztunnel ${{ needs.prepare.outputs.version }}"
+      - name: Validate native GNU/Linux ABI and record ELF dependencies
+        run: |
+          set -euo pipefail
+          binary=target/dist/eztunnel
+          report=target/dist/elf-abi.txt
+          {
+            readelf -hW "$binary"
+            readelf -lW "$binary"
+            readelf -dW "$binary"
+            readelf -VW "$binary"
+            ldd "$binary"
+          } > "$report"
+          grep -Fq 'Class:                             ELF64' "$report"
+          if [[ '${{ matrix.arch }}' == x86_64 ]]; then
+            grep -Fq 'Machine:                           Advanced Micro Devices X86-64' "$report"
+          else
+            grep -Fq 'Machine:                           AArch64' "$report"
+          fi
+          grep -Fq 'INTERP' "$report" || { echo '::error::Expected dynamic GNU/Linux executable'; exit 1; }
+          grep -Fq 'NEEDED' "$report" || { echo '::error::No linked shared libraries reported'; exit 1; }
+          ! grep -Fq 'not found' "$report" || { echo '::error::Missing shared runtime dependency'; exit 1; }
+          required=$(grep -oE 'GLIBC_[0-9]+[.][0-9]+' "$report" | cut -d_ -f2 | sort -V | tail -n 1)
+          test -n "$required" || { echo '::error::No GLIBC version evidence'; exit 1; }
+          if dpkg --compare-versions "$required" gt 2.39; then
+            echo "::error::GLIBC $required exceeds the Ubuntu 24.04 runtime floor 2.39"
+            exit 1
+          fi
+          echo "GNU/Linux ${{ matrix.arch }} ELF validated; highest required GLIBC=$required" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: executable-${{ matrix.arch }}
+          path: |
+            target/dist/eztunnel
+            target/dist/elf-abi.txt
+          retention-days: 2
+  publish:
+    if: github.ref == 'refs/heads/main'
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: executable-*
+          path: artifacts
+      - name: Publish checksum-verified release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::Release/tag $tag already exists; never overwrite published artifacts."
+            exit 1
+          fi
+          mkdir -p release
+          for arch in x86_64 aarch64; do
+            binary="artifacts/executable-$arch/eztunnel"
+            test -f "$binary" || { echo "::error::Missing $arch executable"; exit 1; }
+            mkdir -p "stage-$arch/eztunnel-linux/bin"
+            install -m 755 "$binary" "stage-$arch/eztunnel-linux/bin/eztunnel"
+            cp LICENSE README.md CHANGELOG.md "stage-$arch/eztunnel-linux/"
+            tar -czf "release/eztunnel-linux-$arch.tar.gz" -C "stage-$arch" eztunnel-linux
+          done
+          (cd release && sha256sum eztunnel-linux-*.tar.gz > SHA256SUMS)
+          gh release create "$tag" release/eztunnel-linux-*.tar.gz release/SHA256SUMS \
+            --target "$GITHUB_SHA" --title "EZTunnel fork $VERSION" \
+            --notes "ACh fork based on EZTunnel ${VERSION%%-ach.*}. Source commit: $GITHUB_SHA. Official downloads use HTTPS and SHA256SUMS. Licensed AGPL-3.0-only."

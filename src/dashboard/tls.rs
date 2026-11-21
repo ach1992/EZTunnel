@@ -88,6 +88,11 @@ pub fn server_config(swap: Arc<Swap>) -> Result<Arc<rustls::ServerConfig>> {
     Ok(Arc::new(config))
 }
 
+/// The saved fallback certificate is immutable during a dashboard certificate change.
+pub fn self_signed_der(state_dir: &Path) -> Option<Vec<u8>> {
+    std::fs::read(state_dir.join(CERT_FILE)).ok()
+}
+
 fn self_signed_files(state_dir: &Path, address: &str) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
     let cert_path = state_dir.join(CERT_FILE);
     let key_path = state_dir.join(KEY_FILE);

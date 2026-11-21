@@ -1,9 +1,11 @@
+> **ACh-maintained fork.** We maintain our Fleet CLI/Menu and Dashboard domain controls while the [upstream contribution](https://github.com/B3hnamR/EZTunnel/pull/2) remains under review. Fork releases, installers and program updates come exclusively from [ach1992/EZTunnel](https://github.com/ach1992/EZTunnel). See [fork maintenance](docs/fork-maintenance.md) for upstream sync, release downloads and maintenance procedures. Original upstream attribution is preserved below. Do not run the upstream installer to update a fork installation.
+
 <p align="center">
   <img src="docs/assets/banner.svg?v=0.13.0" alt="EZTunnel: encrypted tunnels, made simple" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://github.com/B3hnamR/EZTunnel/releases/latest"><img src="https://img.shields.io/badge/release-v0.13.0-00afff?style=for-the-badge" alt="Release v0.13.0"></a>
+<a href="https://github.com/ach1992/EZTunnel/releases"><img src="https://img.shields.io/badge/release-fork-00afff?style=for-the-badge" alt="Fork releases"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-875fff?style=for-the-badge" alt="License: AGPL-3.0"></a>
   <img src="https://img.shields.io/badge/built_with-Rust-dea584?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust">
   <img src="https://img.shields.io/badge/Linux-x86__64%20%7C%20ARM64-0087ff?style=for-the-badge&logo=linux&logoColor=white" alt="Linux x86_64 and ARM64">
@@ -32,8 +34,9 @@ config files to write.
   per direction, and automatic session renewal.
 - **Flexible:** 15 transports, from plain TCP to WebSocket, CDN-friendly XHTTP,
   loss-resistant FEC and raw IPv4 carriers.
-- **Yours:** open source and self-hosted, with no telemetry. It only talks to the
-  servers you configure.
+- **Yours:** open source and self-hosted, with no routine telemetry. Tunnel traffic
+  goes to the peers and targets you configure; explicit Release downloads and optional
+  certificate issuance contact GitHub and your certificate authority.
 
 ## What's new in 0.13.0
 
@@ -45,7 +48,7 @@ config files to write.
 - **Alerts and status** show which transport a failover tunnel uses and when one goes down, also
   on Telegram.
 - **One-step updates**: **Update** in the manager's main menu, or `sudo eztunnel upgrade`, gets the
-  newest release from GitHub, checks it and installs it. The dashboard and the agent now restart
+  newest fork release from GitHub, checks its SHA256 checksum and installs it. The dashboard and the agent now restart
   after every update, so they show and run the new version.
 - **Free ports everywhere**: every port the manager and the dashboard suggest is free, and a port
   already in use is named with a free one to take instead.
@@ -76,21 +79,23 @@ carries it.
 Run this as root on **each** server:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/B3hnamR/EZTunnel/main/scripts/install-latest.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh)
 ```
 
 The installer picks the right build for your CPU (x86_64 or ARM64), checks it
 against the release's `SHA256SUMS`, installs `/usr/local/bin/eztunnel` and then opens the manager. It
-never starts, stops or changes existing tunnels.
+never starts, stops or changes existing tunnels. The fork's official binaries target
+GNU/Linux with glibc 2.39 and standard Ubuntu 24.04 shared libraries;
+they are not static musl builds. See [Linux architectures](docs/architectures.md).
 
 <details>
 <summary><b>Prefer to read the installer first, or pin a version?</b></summary>
 
 ```bash
-curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/B3hnamR/EZTunnel/main/scripts/install-latest.sh
+curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh
 less install-eztunnel.sh
 sudo bash install-eztunnel.sh                      # latest release
-sudo bash install-eztunnel.sh --version v0.13.0    # a specific release
+sudo bash install-eztunnel.sh --version v0.12.0-ach.1  # pin a published fork release
 sudo bash install-eztunnel.sh --no-menu            # install only, do not open the manager
 ```
 
@@ -504,7 +509,8 @@ over SSH. From there you can:
 - get alerts in the dashboard and on Telegram.
 
 It runs as its own service over HTTPS with a random port and password, and tunnels never depend on
-it. See [the dashboard guide](docs/dashboard.md).
+it. See [the dashboard guide](docs/dashboard.md), including the current central Web/Menu/CLI
+feature-parity matrix, JSON automation examples, and partial-failure recovery rules.
 
 ## Managing tunnels
 
@@ -595,12 +601,10 @@ The easiest way is **Update** in the manager's main menu, or one command:
 sudo eztunnel upgrade
 ```
 
-It downloads the newest release for this server's CPU from GitHub, checks it against the published
-checksum and the official signature, installs it, restarts the running tunnels (and puts the old
-version back by itself if one does not stay up), and restarts the dashboard and the agent so they
-run the new version. If the server cannot reach GitHub, use a proxy:
-`sudo eztunnel upgrade --proxy socks5h://127.0.0.1:1080`. The dashboard's **Maintenance** page
-updates every server from one place.
+It downloads the newest **fork release** for this server's CPU from GitHub, checks its
+SHA256 checksum, installs it, restarts running tunnels (and puts the old version back if one
+does not stay up), and restarts the Dashboard and Agent processes. If GitHub is unreachable,
+use a proxy: `sudo eztunnel upgrade --proxy socks5h://127.0.0.1:1080`.
 
 Running the installer again also updates the program file and restarts the dashboard and the
 agent, but **not** the tunnels, which keep the old version until you restart them:
@@ -640,7 +644,7 @@ Coming next to EZTunnel:
 |---|---|
 | **Three new anti-censorship transports** | New carriers built to get through heavy filtering where today's transports are blocked or throttled. |
 
-Planned features may change before they ship. Follow the [releases](https://github.com/B3hnamR/EZTunnel/releases) to see them land.
+Planned features may change before they ship. Follow the [fork releases](https://github.com/ach1992/EZTunnel/releases) to see them land.
 
 ## Using JSON instead of the menu
 
@@ -670,7 +674,7 @@ Examples are in [`examples/`](examples/); every field is described in the
 <summary><b>Build on Linux or WSL</b></summary>
 
 ```bash
-git clone https://github.com/B3hnamR/EZTunnel.git
+git clone https://github.com/ach1992/EZTunnel.git
 cd EZTunnel
 cargo build --locked --release
 cargo test --locked --release --all-targets
@@ -680,7 +684,7 @@ The default build includes browser-compatible TLS and needs a C/C++ toolchain, C
 and libclang. `--no-default-features` builds without browser TLS (not full feature
 parity). Releases are validated with Rust 1.98.1.
 
-Static release builds:
+Optional static-musl source builds (not the fork's official GitHub Release assets):
 
 ```bash
 rustup target add x86_64-unknown-linux-musl

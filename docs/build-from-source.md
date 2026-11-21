@@ -2,18 +2,19 @@
 
 ## Architecture Support
 
-Full-feature static releases are available for Linux x86-64 and ARM64. Read
-[architectures.md](architectures.md) for the validated ARM64 cross-toolchain,
-native-test scope and ELF differences. Both include browser-compatible TLS and
-the six optional transport extensions; `--no-default-features` below is an
-explicit user choice, not the ARM64 release configuration. Match packages to
-`uname -m`; installers reject the wrong architecture before execution.
+The fork's official GitHub Releases are **native dynamically linked GNU/Linux
+builds** for x86-64 and ARM64 (Ubuntu 24.04 glibc 2.39 runtime baseline).
+Static musl builds are a separate **optional source-build** path, not what the
+one-line installer downloads. See [architectures.md](architectures.md).
+Both release architectures include browser-compatible TLS and the optional
+transports; `--no-default-features` below is a source-build choice only.
+The installer rejects wrong-architecture or non-runnable files before installation.
 
 In the commands below, replace `VERSION` with the release you downloaded. Releases
 are validated with Rust 1.98.1;
 the manifest's 1.88 minimum has not been revalidated against every current native
 dependency. Cross-compiling musl requires a matching C/C++/header sysroot, not
-merely a Rust target installation. Build tools never need application signing keys.
+merely a Rust target installation. Build tools never need release credentials.
 
 Tested on Ubuntu and Debian. You need `eztunnel-VERSION-source.tar.gz` and the matching `SHA256SUMS`.
 
@@ -58,9 +59,9 @@ sudo bash scripts/install.sh --binary target/release/eztunnel
 sudo eztunnel
 ```
 
-## 5. Static build (runs on any x86-64 Linux)
+## 5. Optional static musl build (separate from fork Releases)
 
-A static binary does not depend on the server's system libraries, so it also runs on older distributions:
+A correctly built static-musl binary does not depend on glibc and may be useful for older distributions:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl

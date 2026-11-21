@@ -3,7 +3,7 @@
   // Telegram alerts, automatic backups, the download proxy, the metrics endpoint and the colours.
   import { untrack } from "svelte";
   import Icon from "../lib/Icon.svelte";
-  import { getSettings, saveSettings, setPassword, getSessions, revokeSession, testTelegram } from "../lib/api.js";
+  import { getSettings, saveSettings, certificateStatus, changeCertificate, setPassword, getSessions, revokeSession, testTelegram } from "../lib/api.js";
   import { say, ask } from "../lib/actions.svelte.js";
   import { t, num, duration, ui, setTheme, clock } from "../lib/i18n.svelte.js";
   import { copyText } from "../lib/share.js";
@@ -15,6 +15,9 @@
   let loading = $state(false);
   let sessions = $state([]);
   let form = $state({ days: "7", proxy: "", tg: { enabled: false, token: "", chats: "", lang: "en", level: "bad", resolved: true } });
+  let domain = $state("");
+  let certTask = $state(null);
+  let nextUrl = $state("");
   let metricsToken = $state("");
   let saving = $state("");
 
@@ -29,6 +32,7 @@
       }
       loadFailed = false;
       info = data;
+      if (!certTask?.running) domain = data.panel.certificate_address ?? "";
       const p = data.prefs;
       form = {
         days: String(p.auto_backup_days), proxy: p.proxy ?? "",
@@ -134,6 +138,44 @@
     } catch {}
   }
 
+  async function refreshCertificate() {
+    try {
+      const { status, data } = await certificateStatus();
+      if (status !== 200) return;
+      const previous = certTask;
+      certTask = data;
+      if (previous?.running && !data.running && !data.error) {
+        say(t(data.restart_required ? "certRestartRequired" : data.active ? "certApplied" : "certApplying"));
+        load();
+      } else if (previous?.restart_required && data.active) {
+        say(t("certApplied"));
+        load();
+      }
+    } catch { /* The server may be restarting with a different certificate/hostname. */ }
+  }
+  $effect(() => {
+    untrack(refreshCertificate);
+    const poll = setInterval(refreshCertificate, 3_000);
+    return () => clearInterval(poll);
+  });
+
+  async function applyCertificate(mode) {
+    saving = "certificate";
+    try {
+      const address = domain.trim();
+      const { status, data } = await changeCertificate(mode === "lets_encrypt" ? { mode, address } : { mode });
+      if (status !== 202) return say(data?.detail ?? t("failedShort"), true);
+      certTask = { running: true, address, error: null };
+      nextUrl = data.url;
+      say(t("certStarted"));
+    } catch { say(t("slowShort"), true); }
+    finally { saving = ""; }
+  }
+
+  function resetCertificate() {
+    ask(t("certResetQ"), t("certResetText"), t("certReset"), () => applyCertificate("self_signed"));
+  }
+
   // Password.
   let pw = $state({ current: "", next: "", again: "" });
   const pwError = $derived(pw.next && pw.next.length < 12 ? t("pwShort") : pw.again && pw.again !== pw.next ? t("pwMismatch") : "");
@@ -197,7 +239,30 @@
         <div><dt>{t("stData")}</dt><dd class="ltr mono">{info.panel.state_dir}</dd></div>
       </dl>
       <p class="muted small m0 mt12">{t("stPanelNote")}</p>
-      <div class="cmdline ltr mt12">eztunnel dashboard certificate --lets-encrypt</div>
+      <label class="flabel mt12" for="dash-domain">{t("certDomain")}</label>
+      <div class="row-flex">
+        <input id="dash-domain" class="input ltr grow" type="text" inputmode="url" autocomplete="off" spellcheck="false" bind:value={domain} placeholder="panel.example.com" aria-describedby="dash-domain-help" />
+        <button class="btn primary" onclick={() => applyCertificate("lets_encrypt")} disabled={!domain.trim() || saving === "certificate" || certTask?.running} aria-busy={saving === "certificate"}>{t("certApply")}</button>
+      </div>
+      <p id="dash-domain-help" class="muted small mt12">{t("certHelp")}</p>
+      {#if info.panel.certificate_address}
+        <div class="row-flex mt12">
+          <span class="small muted">{t("certActive")} <span class="ltr">{info.panel.certificate_address}</span></span>
+          <button class="btn ghost" onclick={resetCertificate} disabled={saving === "certificate" || certTask?.running}>{t("certReset")}</button>
+        </div>
+      {/if}
+      {#if certTask?.running}
+        <p class="small warn-t mt12" role="status">{t("certWorking")}</p>
+      {:else if certTask?.error}
+        <div class="note bad mt12" role="alert">{t("certFailed")} <span class="ltr edesc">{certTask.error}</span></div>
+      {:else if certTask?.restart_required}
+        <div class="note warn mt12" role="status">{t("certRestartRequired")}</div>
+      {:else if certTask?.active && certTask?.configured_address}
+        <p class="small ok-t mt12" role="status">{t("certServing", certTask.configured_address)}</p>
+      {/if}
+      {#if nextUrl}
+        <p class="small mt12">{t("certNext")} <a class="ltr" href={nextUrl} target="_blank" rel="noopener noreferrer">{nextUrl}</a></p>
+      {/if}
     </section>
 
     <section class="panel" aria-labelledby="st-pw">

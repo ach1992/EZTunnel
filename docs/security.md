@@ -2,22 +2,25 @@
 
 ## Builds And Updates
 
-Source builds run directly. The built-in updater accepts only cryptographically
-verified official files, authenticating bytes before executing a candidate. Custom builds can be installed through the explicit local
-installer without starting services. No private signing keys are required to
-build or test the application.
+The fork's official installer and Dashboard download from `ach1992/EZTunnel`
+over HTTPS and check each archive against the published SHA256SUMS.
+This prevents mismatched or corrupted files, but not compromise of the
+GitHub account publishing both archives and checksums. Operator uploads are
+intentional administrator input and require independent confirmation of the
+source and SHA256. Agent transfers use authenticated management channels,
+SHA256 matching and private staging to prevent a path swap between reading
+and executing an executable. Rollback accepts only the locally recorded
+previous-program checksum. No separate release-signing Secret is needed.
 
-Version 0.9.0 introduced the current protocol. Both endpoints must update together;
-see [the protocol contract](protocol.md). Wire 1..3 are configuration choices within
-it, not compatibility switches for older versions. Official release signing is a
-separate, controlled workflow; this checkout includes only public update verification.
-
+Version 0.9.0 introduced the current protocol. Both endpoints must update
+together; see [the protocol contract](protocol.md). Wire 1..3 are
+configuration choices within it, not compatibility switches for older versions.
 
 Both servers of a tunnel hold the same tunnel key: 24 random symbols (120 bits) and a check symbol. The server's and the client's Noise identities are derived from it, the client pins the server identity and the server accepts only the client identity. Noise IK authenticates and encrypts records using X25519, ChaCha20-Poly1305, and BLAKE2s. With `tls_auto`, TLS carriers present a certificate derived from the same key and the dialing side accepts exactly that certificate; otherwise they verify certificates and server names in the usual way. No insecure-certificate switch is provided.
 
 Anyone who has the tunnel key can act as either server, so treat it like a password: the manager stores it only in `/etc/eztunnel/tunnels/NAME.json`, readable only by root and the service account, and the program refuses to load a file with a key that other users can read. Someone who records a handshake cannot test guesses faster than the key's 120 bits allow. To change a key, create the tunnel again on both servers. Separate key files (`private_key_file`, `peer_public_keys`) remain supported for setups that want a different identity per server.
 
-No application code contacts an external API, identity server, or telemetry service. It does not download another executable. Normal network access consists of configured tunnel peers and authorized target traffic, including ordinary system DNS lookup for hostnames. Installing Rust dependencies from source still uses the usual package registry unless dependencies are already cached.
+Ordinary tunnel operation contacts configured peers and authorized target traffic (including normal DNS), without an EZTunnel identity or telemetry service. **Explicit, authenticated Dashboard update/release operations** contact `api.github.com` to check versions and `github.com` to download executable archives plus SHA256SUMS; the one-line installer similarly downloads from the fork's GitHub Releases. Dashboard TLS certificate issuance and renewal contact the configured ACME certificate authority. Building from source may contact the package registry for dependencies. There is no routine application telemetry or externally hosted user-identity service.
 
 Tools → Export all tunnels writes every tunnel configuration, tunnel keys included, to one file that only its owner can read; treat it like the keys themselves and delete it after use. Tunnel keys, private Noise identities and TLS private keys stay local and must not be committed or put in release archives. Generated private files use Unix mode 0600 and are never overwritten. Copy the tunnel key (or public keys and trust certificates) between servers over a trusted channel such as SSH. The manager runs each tunnel as the unprivileged `eztunnel` account with only the capabilities it needs (binding ports below 1024, raw sockets, or creating a TUN device).
 
