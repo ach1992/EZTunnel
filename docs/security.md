@@ -2,16 +2,19 @@
 
 ## Builds And Updates
 
-Source builds run directly. The built-in updater accepts only cryptographically
-verified official files, authenticating bytes before executing a candidate. Custom builds can be installed through the explicit local
-installer without starting services. No private signing keys are required to
-build or test the application.
+The fork's official installer and Dashboard download from `ach1992/EZTunnel`
+over HTTPS and check each archive against the published SHA256SUMS.
+This prevents mismatched or corrupted files, but not compromise of the
+GitHub account publishing both archives and checksums. Operator uploads are
+intentional administrator input and require independent confirmation of the
+source and SHA256. Agent transfers use authenticated management channels,
+SHA256 matching and private staging to prevent a path swap between reading
+and executing an executable. Rollback accepts only the locally recorded
+previous-program checksum. No separate release-signing Secret is needed.
 
-Version 0.9.0 introduced the current protocol. Both endpoints must update together;
-see [the protocol contract](protocol.md). Wire 1..3 are configuration choices within
-it, not compatibility switches for older versions. Official release signing is a
-separate, controlled workflow; this checkout includes only public update verification.
-
+Version 0.9.0 introduced the current protocol. Both endpoints must update
+together; see [the protocol contract](protocol.md). Wire 1..3 are
+configuration choices within it, not compatibility switches for older versions.
 
 Both servers of a tunnel hold the same tunnel key: 24 random symbols (120 bits) and a check symbol. The server's and the client's Noise identities are derived from it, the client pins the server identity and the server accepts only the client identity. Noise IK authenticates and encrypts records using X25519, ChaCha20-Poly1305, and BLAKE2s. With `tls_auto`, TLS carriers present a certificate derived from the same key and the dialing side accepts exactly that certificate; otherwise they verify certificates and server names in the usual way. No insecure-certificate switch is provided.
 
