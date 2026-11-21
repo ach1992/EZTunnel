@@ -6,7 +6,7 @@ This repository remains a GitHub fork of [B3hnamR/EZTunnel](https://github.com/B
 
 The scheduled/manual **Propose upstream sync** workflow fetches upstream `main`, merges it into an isolated `sync/upstream-<sha>` branch and opens a PR **into our own fork main**. It does not push upstream, force-update main, integrate, publish, or deploy. A merge conflict fails visibly; a human resolves it in a task branch and re-tests rather than discarding either side. It leaves an already-open sync PR alone. Since PRs created with `GITHUB_TOKEN` do not trigger ordinary PR workflows, the sync workflow explicitly dispatches Fork CI for its branch.
 
-Before accepting a sync PR, verify the changes preserve the fork's Fleet CLI and Dashboard domain controls, fork-owned release/download/signing identity, the distinct package version, and committed generated UI assets. Run the required CI and obtain exact-diff independent review before integrating. For a manual sync use `git remote add upstream https://github.com/B3hnamR/EZTunnel.git`, `git fetch upstream main`, and `git merge --no-ff upstream/main` from a new branch based on fork main. Never `reset --hard` fork main to upstream.
+Before accepting a sync PR, verify the changes preserve the fork's Fleet CLI and Dashboard domain controls, fork-owned Release/download identity, the distinct package version, and committed generated UI assets. Run the required CI and obtain exact-diff independent review before integrating. For a manual sync use `git remote add upstream https://github.com/B3hnamR/EZTunnel.git`, `git fetch upstream main`, and `git merge --no-ff upstream/main` from a new branch based on fork main. Never `reset --hard` fork main to upstream.
 
 ## Official Releases and installation
 
