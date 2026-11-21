@@ -1,4 +1,4 @@
-name: Publish signed fork release
+name: Publish fork release
 on:
   workflow_dispatch:
 permissions:
@@ -12,26 +12,18 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.meta.outputs.version }}
-      public_key: ${{ steps.meta.outputs.public_key }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.88.0
-      - name: Verify signing key and source version
+      - name: Read release version
         id: meta
-        env:
-          EZTUNNEL_RELEASE_KEY_HEX: ${{ secrets.EZTUNNEL_RELEASE_KEY_HEX }}
         run: |
           set -euo pipefail
-          test -n "$EZTUNNEL_RELEASE_KEY_HEX" || { echo '::error::Provision EZTUNNEL_RELEASE_KEY_HEX before releasing.'; exit 1; }
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "eztunnel") | .version')
-          public_key=$(cargo run --locked --no-default-features --bin release-sign -- --public-key)
-          # A reviewed, non-secret pin is authoritative: replacing the Actions secret
-          # alone can never change the release trust identity.
-          bash scripts/verify-fork-release-public-key.sh "$public_key"
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "eztunnel") | .version')
+          test -n "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "public_key=$public_key" >> "$GITHUB_OUTPUT"
   build:
     needs: prepare
     strategy:
@@ -51,19 +43,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: Install BoringSSL build dependencies
+      - name: Install native TLS build dependencies
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev cmake pkg-config g++
       - run: npm ci && npm run build
         working-directory: dashboard-ui
       - run: git diff --exit-code -- src/dashboard/ui/
-      - name: Build full-featured fork with embedded fork release identity
-        env:
-          EZTUNNEL_RELEASE_PUBLIC_KEY_HEX: ${{ needs.prepare.outputs.public_key }}
+      - name: Build full-featured fork
         run: cargo build --locked --profile dist --bin eztunnel
       - run: test "$(./target/dist/eztunnel --version)" = "eztunnel ${{ needs.prepare.outputs.version }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: unsigned-${{ matrix.arch }}
+          name: executable-${{ matrix.arch }}
           path: target/dist/eztunnel
           retention-days: 2
   publish:
@@ -71,37 +61,31 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.88.0
       - uses: actions/download-artifact@v4
         with:
-          pattern: unsigned-*
-          path: unsigned
-      - name: Sign and publish versioned release assets
+          pattern: executable-*
+          path: artifacts
+      - name: Publish checksum-verified release assets
         env:
-          EZTUNNEL_RELEASE_KEY_HEX: ${{ secrets.EZTUNNEL_RELEASE_KEY_HEX }}
-          EZTUNNEL_RELEASE_PUBLIC_KEY_HEX: ${{ needs.prepare.outputs.public_key }}
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           tag="v$VERSION"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "::error::Release $tag already exists; do not overwrite published artifacts."
+          if gh release view "$tag" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::Release/tag $tag already exists; never overwrite published artifacts."
             exit 1
           fi
-          cargo build --locked --no-default-features --bin release-sign
-          bash scripts/verify-fork-release-public-key.sh "$(target/debug/release-sign --public-key)"
           mkdir -p release
           for arch in x86_64 aarch64; do
+            binary="artifacts/executable-$arch/eztunnel"
+            test -f "$binary" || { echo "::error::Missing $arch executable"; exit 1; }
             mkdir -p "stage-$arch/eztunnel-linux/bin"
-            target/debug/release-sign --sign "unsigned/unsigned-$arch/eztunnel" "stage-$arch/eztunnel-linux/bin/eztunnel"
-            chmod 755 "stage-$arch/eztunnel-linux/bin/eztunnel"
+            install -m 755 "$binary" "stage-$arch/eztunnel-linux/bin/eztunnel"
             cp LICENSE README.md CHANGELOG.md "stage-$arch/eztunnel-linux/"
             tar -czf "release/eztunnel-linux-$arch.tar.gz" -C "stage-$arch" eztunnel-linux
           done
           (cd release && sha256sum eztunnel-linux-*.tar.gz > SHA256SUMS)
           gh release create "$tag" release/eztunnel-linux-*.tar.gz release/SHA256SUMS \
             --target "$GITHUB_SHA" --title "EZTunnel fork $VERSION" \
-            --notes "Fork release based on EZTunnel 0.12.0 with Fleet CLI and Dashboard domain controls. Source: https://github.com/ach1992/EZTunnel/tree/$GITHUB_SHA. Licensed AGPL-3.0-only."
+            --notes "ACh fork based on EZTunnel 0.12.0. Source commit: $GITHUB_SHA. Official downloads use HTTPS and SHA256SUMS. Licensed AGPL-3.0-only."

@@ -373,13 +373,20 @@ fn record_previous(target: &Path) {
     }
 }
 
-/// A rollback target is either one this updater itself kept (its recorded hash matches: it is
-/// the program that was installed here before, which may carry no signature) or a validly
-/// signed release. Anything else is not run as root.
+/// A rollback target must match the exact previous executable recorded by this updater.
 fn ensure_rollback_trusted(target: &Path, bytes: &[u8]) -> Result<()> {
-    let _ = target;
-    ensure_signed_bytes(bytes)
-        .context("the previous program is not signed by the release authority")
+    let recorded = std::fs::read_to_string(previous_hash_path(target))
+        .context("no recorded checksum for the previous program; refusing untracked rollback")?;
+    let expected = recorded.trim();
+    ensure!(
+        expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
+        "the recorded previous-program checksum is invalid"
+    );
+    ensure!(
+        hex::encode(Sha256::digest(bytes)).eq_ignore_ascii_case(expected),
+        "the previous program differs from the updater's recorded checksum"
+    );
+    Ok(())
 }
 
 /// Where `eztunnel update` and `eztunnel rollback` also write what they print, so the result can
@@ -534,11 +541,9 @@ fn perform_with_sync(
     host.validate_target(target)?;
     let _lock = UpdateLock::acquire(target)?;
     let previous = previous_path(target);
-    // Official updater candidates require release-file authentication. Read once and
-    // authenticated BEFORE anything of it runs; from here on only a private copy of exactly
-    // those bytes is executed or installed.
+    // Caller explicitly chooses a file or the Dashboard verifies fork SHA256SUMS.
+    // Only this private copy is executed or installed.
     let bytes = read_program(candidate)?;
-    ensure_signed_bytes(&bytes)?;
     let staged = Staged::write(&bytes, target)?;
     drop(bytes);
     let new_version = host.version(staged.path()).context("run the new program")?;
@@ -557,8 +562,6 @@ fn perform_with_sync(
         target.display()
     );
     let old_bytes = read_program(target)?;
-    ensure_signed_bytes(&old_bytes)
-        .context("the installed program is not a trusted signed release")?;
     let old_staged = Staged::write(&old_bytes, target)?;
     let old_version = host
         .version(old_staged.path())
@@ -592,10 +595,14 @@ fn perform_with_sync(
         host.running_tunnels()?
     };
     say(&format!("Updating {old_version} → {new_version}"));
-    // The program kept by an earlier update stays safe until this one has worked: a failed
-    // update must not cost the older backup.
+    // Failed updates must preserve the older program and its recorded checksum.
     let earlier = keep_path(&previous);
     let had_earlier = previous.exists();
+    let recorded_earlier = match std::fs::read(previous_hash_path(target)) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     if had_earlier {
         std::fs::rename(&previous, &earlier).context("set the earlier backup aside")?;
     }
@@ -604,6 +611,11 @@ fn perform_with_sync(
             let _ = std::fs::rename(&earlier, &previous);
         } else {
             let _ = std::fs::remove_file(&previous);
+        }
+        if let Some(ref bytes) = recorded_earlier {
+            let _ = std::fs::write(previous_hash_path(target), bytes);
+        } else {
+            let _ = std::fs::remove_file(previous_hash_path(target));
         }
     };
     if let Err(error) = replace_file(target, &previous) {
@@ -678,8 +690,7 @@ pub fn rollback(host: &dyn Host, target: &Path, options: &Options) -> Result<Out
         "there is no previous program ({} is missing)",
         previous.display()
     );
-    // Same discipline as an update: read once, require that these bytes are the program this
-    // updater kept and a valid release signature, and run only a private copy of them.
+    // Read once, verify the updater's recorded checksum and stage a private copy.
     let bytes = read_program(&previous)?;
     ensure_rollback_trusted(target, &bytes)?;
     let staged = Staged::write(&bytes, target)?;
@@ -692,7 +703,6 @@ pub fn rollback(host: &dyn Host, target: &Path, options: &Options) -> Result<Out
         .context("the previous program cannot read a saved tunnel; nothing was changed")?;
     let current = read_program(target)
         .and_then(|bytes| {
-            ensure_signed_bytes(&bytes)?;
             let staged_current = Staged::write(&bytes, target)?;
             host.version(staged_current.path())
         })
@@ -846,23 +856,6 @@ impl Host for System {
     }
 }
 
-/// Official updater candidates require a release signature, independently of execution.
-fn ensure_signed_bytes(bytes: &[u8]) -> Result<()> {
-    // Unit tests use fake, unsigned program files; a test that wants the real check turns it
-    // on for its own thread. Nothing here exists in a shipped build.
-    #[cfg(test)]
-    if !tests::ENFORCE_SIGNING.with(|flag| flag.get()) {
-        return Ok(());
-    }
-    match crate::release::verify_bytes(bytes) {
-        crate::release::Outcome::Verified => Ok(()),
-        other => bail!(
-            "this build only installs officially signed program files; this file is {other:?}. Download the release from the official source and check its SHA-256."
-        ),
-    }
-}
-
-
 /// `eztunnel update`: this program file installs itself.
 pub fn run_update(target: &Path, options: &Options) -> Result<()> {
     ensure!(
@@ -953,14 +946,8 @@ pub fn update_screen() -> Result<()> {
         }
         Ok(path)
     })?;
-    // This menu runs as root, so it must not run a downloaded file it has not authenticated.
-    // The file is read once, verified, and only a private root-only copy of those bytes runs.
+    // The operator confirmed the published checksum; stage those exact bytes.
     let bytes = read_program(&path)?;
-    if let Err(error) = ensure_signed_bytes(&bytes) {
-        ui::fail(&format!("{error:#}"));
-        ui::pause();
-        return Ok(());
-    }
     #[cfg(target_os = "linux")]
     validate_installation_target(Path::new("/usr/local/bin/eztunnel.incoming"))?;
     let staged = Staged::write(&bytes, Path::new("/usr/local/bin/eztunnel.incoming"))?;
@@ -992,12 +979,11 @@ pub fn update_screen() -> Result<()> {
     Ok(())
 }
 
-/// The dashboard's update: the same checks and staging as Tools → Update, without questions.
-/// Only an officially signed program file is run. Returns what the new program printed.
-pub(crate) fn install_signed(bytes: &[u8], allow_downgrade: bool) -> Result<String> {
+/// Install bytes selected by an authenticated Dashboard administrator.
+/// Official downloads are HTTPS + SHA256SUMS checked; transfers verify SHA-256.
+pub(crate) fn install_checked(bytes: &[u8], allow_downgrade: bool) -> Result<String> {
     ensure!(super::store::is_root(), "updating changes system files: run it as root");
     ensure!(bytes.len() as u64 <= MAX_PROGRAM_BYTES, "the file is too large to be an EZTunnel program");
-    ensure_signed_bytes(bytes)?;
     #[cfg(target_os = "linux")]
     validate_installation_target(Path::new("/usr/local/bin/eztunnel.incoming"))?;
     let staged = Staged::write(bytes, Path::new("/usr/local/bin/eztunnel.incoming"))?;
@@ -1094,12 +1080,6 @@ mod tests {
         version_in(path) == version
     }
 
-    // Generic state-machine tests use explicit fake executable bytes.
-    thread_local! {
-        /// Whether `ensure_signed_bytes` really checks signatures on this test thread.
-        pub(super) static ENFORCE_SIGNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
     /// A host that fails the test if anything is run: used to prove a refused file never runs.
     struct Tripwire;
 
@@ -1125,29 +1105,6 @@ mod tests {
         fn sleep(&self, _: Duration) {}
     }
 
-    /// A signed candidate is installed from the bytes that were verified; an unsigned one is
-    /// refused before any of it runs.
-    #[test]
-    fn an_unsigned_candidate_is_refused_before_it_runs() {
-        ENFORCE_SIGNING.with(|flag| flag.set(true));
-        let (_directory, target, new) = setup("1.0.0", "1.1.0");
-        let options = Options {
-            allow_downgrade: false,
-            no_restart: true,
-        };
-        let error = perform(&Tripwire, &new, &target, &options).unwrap_err();
-        assert!(
-            format!("{error:#}").contains("officially signed"),
-            "{error:#}"
-        );
-        // Nothing was staged, installed or kept.
-        assert!(!previous_path(&target).exists());
-        assert!(has_version(&target, "1.0.0"));
-        let mut staged = target.as_os_str().to_owned();
-        staged.push(".staged");
-        assert!(!PathBuf::from(staged).exists());
-    }
-
     #[test]
     fn ordinary_updates_never_cross_the_0_9_protocol_boundary() {
         assert!(check_protocol_boundary("0.8.9").is_err());
@@ -1158,30 +1115,26 @@ mod tests {
     }
 
     #[test]
-    fn rollback_refuses_an_untracked_unsigned_previous_program_and_never_runs_it() {
-        ENFORCE_SIGNING.with(|flag| flag.set(true));
+    fn rollback_refuses_an_untracked_previous_program_and_never_runs_it() {
         let (_directory, target, _new) = setup("1.1.0", "1.0.0");
-        // A `.previous` that this updater did not keep (no recorded hash) and that carries no
-        // release signature.
+        // A .previous file without a recorded checksum is not an updater-owned backup.
         std::fs::write(previous_path(&target), program("0.9.0", "planted")).unwrap();
         let options = Options {
             allow_downgrade: true,
             no_restart: true,
         };
         let error = rollback(&Tripwire, &target, &options).unwrap_err();
-        assert!(format!("{error:#}").contains("not signed"), "{error:#}");
+        assert!(format!("{error:#}").contains("no recorded checksum"), "{error:#}");
         assert!(has_version(&target, "1.1.0"));
     }
 
-    /// An adjacent checksum is diagnostic data, never a substitute for a release signature.
     #[test]
-    fn rollback_requires_a_release_signature_even_when_the_recorded_hash_matches() {
-        ENFORCE_SIGNING.with(|flag| flag.set(true));
+    fn rollback_accepts_only_the_recorded_previous_checksum() {
         let (_directory, target, new) = setup("1.0.0", "1.1.0");
         let bytes = std::fs::read(&new).unwrap();
         std::fs::write(previous_path(&target), &bytes).unwrap();
         record_previous(&target);
-        assert!(ensure_rollback_trusted(&target, &bytes).is_err());
+        assert!(ensure_rollback_trusted(&target, &bytes).is_ok());
         let mut swapped = bytes.clone();
         swapped.push(b'!');
         std::fs::write(previous_path(&target), &swapped).unwrap();
@@ -1323,8 +1276,7 @@ mod tests {
     }
 
     fn fake(target: &Path, running: &[&str]) -> Fake {
-        // These tests use fake program files without release trailers: signing is not
-        // enforced on their threads unless a test asks for it.
+        // These state-machine tests use harmless fake executable fixtures.
         Fake {
             running: running.iter().map(|n| n.to_string()).collect(),
             broken_with: HashMap::new(),
@@ -1397,36 +1349,23 @@ mod tests {
         }
     }
 
+
     #[test]
-    fn signed_fixture_update_and_rollback_validate_exact_bytes_without_private_authority() {
-        use ed25519_dalek::Signer;
-        let key = ed25519_dalek::SigningKey::from_bytes(&[91; 32]);
-        crate::release::with_fixture_authority(key.verifying_key().to_bytes(), || {
-            ENFORCE_SIGNING.with(|flag| flag.set(true));
-            let (_directory, target, candidate) = setup("0.9.0", "0.9.1");
-            for path in [&target, &candidate] {
-                let mut bytes = std::fs::read(path).unwrap();
-                let signature = key.sign(blake3::hash(&bytes).as_bytes());
-                bytes.extend_from_slice(b"EZT1");
-                bytes.push(239);
-                bytes.extend_from_slice(&signature.to_bytes());
-                bytes.extend_from_slice(&[0; 3]);
-                std::fs::write(path, bytes).unwrap();
-            }
-            let original = std::fs::read(&target).unwrap();
-            let new = std::fs::read(&candidate).unwrap();
-            let host = fake(&target, &[]);
-            perform(&host, &candidate, &target, &Options { allow_downgrade: false, no_restart: true }).unwrap();
-            assert_eq!(std::fs::read(&target).unwrap(), new);
-            assert_eq!(std::fs::read(previous_path(&target)).unwrap(), original);
-            rollback(&host, &target, &Options { allow_downgrade: true, no_restart: true }).unwrap();
-            assert_eq!(std::fs::read(&target).unwrap(), original);
-            let mut corrupt = new;
-            corrupt[20] ^= 1;
-            std::fs::write(&candidate, corrupt).unwrap();
-            assert!(perform(&host, &candidate, &target, &Options { allow_downgrade: true, no_restart: true }).is_err());
-            assert_eq!(std::fs::read(&target).unwrap(), original);
-        });
+    fn update_rollback_and_corrupted_previous_keep_exact_bytes() {
+        let (_directory, target, candidate) = setup("0.9.0", "0.9.1");
+        let original = std::fs::read(&target).unwrap();
+        let new = std::fs::read(&candidate).unwrap();
+        let host = fake(&target, &[]);
+        perform(&host, &candidate, &target, &Options { allow_downgrade: false, no_restart: true }).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), new);
+        assert_eq!(std::fs::read(previous_path(&target)).unwrap(), original);
+        rollback(&host, &target, &Options { allow_downgrade: true, no_restart: true }).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        let mut damaged = std::fs::read(previous_path(&target)).unwrap();
+        damaged[20] ^= 1;
+        std::fs::write(previous_path(&target), damaged).unwrap();
+        assert!(rollback(&host, &target, &Options { allow_downgrade: true, no_restart: true }).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), original);
     }
 
     #[test]

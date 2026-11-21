@@ -116,10 +116,6 @@ pub fn keep(bytes: &[u8], dir: &Path) -> Result<Value> {
         Some(183) => "aarch64",
         _ => bail!("this is not a Linux x86_64 or aarch64 program"),
     };
-    match crate::release::verify_bytes(bytes) {
-        crate::release::Outcome::Verified => {}
-        other => bail!("only officially signed program files can be installed; this one is {other:?}"),
-    }
     let sum = sha256_hex(bytes);
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.bin", &sum[..16]));
@@ -260,14 +256,14 @@ pub fn receive(request: &Value) -> Result<Value> {
     }
 }
 
-/// Installs the program this server received (or, on the dashboard's server, one given
-/// directly), after checking its checksum; the updater checks the signature again.
+/// Installs a received program through the authenticated management channel
+/// after validating its checksum against the expected transfer.
 pub fn install_received(allow_downgrade: bool) -> Result<Value> {
     let (size, sum) = INCOMING.lock().unwrap().take().context("no program was sent")?;
     let bytes = std::fs::read(incoming_path())?;
     let _ = std::fs::remove_file(incoming_path());
     ensure!(bytes.len() as u64 == size && sha256_hex(&bytes) == sum, "the program did not arrive intact");
-    let output = update::install_signed(&bytes, allow_downgrade)?;
+    let output = update::install_checked(&bytes, allow_downgrade)?;
     Ok(json!({"done": true, "output": output}))
 }
 
