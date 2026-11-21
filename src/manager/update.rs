@@ -585,6 +585,15 @@ fn perform_with_recorder(
     let _lock = UpdateLock::acquire(target)?;
     let previous = previous_path(target);
     let is_rollback = candidate == previous;
+    // Check under the update lock: another in-flight update can temporarily
+    // move .previous aside while preserving its older recovery history.
+    if is_rollback {
+        ensure!(
+            previous.try_exists().context("inspect previous program for rollback")?,
+            "there is no previous program ({} is missing)",
+            previous.display()
+        );
+    }
     // Authenticate the saved previous program under the same update lock.
     let bytes = read_program(candidate)?;
     if is_rollback {
@@ -609,13 +618,22 @@ fn perform_with_recorder(
     );
     let old_bytes = read_program(target)?;
     let old_staged = Staged::write(&old_bytes, target)?;
-    let old_version = host
-        .version(old_staged.path())
-        .context("run the installed program to read its version")?;
-    
-    
+    // An emergency rollback must work even if the currently installed program
+    // no longer executes. Its version is diagnostic only; the saved program
+    // and checksum, not the broken current program, are recovery prerequisites.
+    let old_version = if is_rollback {
+        host.version(old_staged.path()).unwrap_or_else(|error| {
+            say(&format!(
+                "Cannot determine the installed program version ({error:#}); recovering the verified previous program."
+            ));
+            "unknown".to_owned()
+        })
+    } else {
+        host.version(old_staged.path())
+            .context("run the installed program to read its version")?
+    };
     host.check_state_for(&new_version)?;
-    if !options.no_restart {
+    if !is_rollback && !options.no_restart {
         host.check_state_for(&old_version)
             .context("the installed program cannot provide a compatible recovery path; a coordinated migration requires --no-restart")?;
     }
@@ -625,19 +643,26 @@ fn perform_with_recorder(
             "the installed version {old_version} is not older than {new_version}; use --allow-downgrade to install it anyway"
         );
     }
-    match (elf_machine(target), elf_machine(staged.path())) {
-        (Some(installed), Some(new)) => ensure!(
-            installed == new,
-            "the new program is for a different CPU architecture than the installed one"
-        ),
-        (_, None) => bail!("the new file is not a Linux program"),
-        _ => {}
-    }
-    host.check_configs()
-        .context("the installed program cannot read a saved tunnel; nothing was changed")?;
+    // A damaged current ELF header is not authoritative during recovery.
+    // The saved executable must still be a valid ELF and must run on this host.
     if is_rollback {
+        ensure!(
+            elf_machine(staged.path()).is_some(),
+            "the previous program is not a Linux executable"
+        );
         host.check_configs_as(staged.path())
             .context("the previous program cannot read a saved tunnel; nothing was changed")?;
+    } else {
+        match (elf_machine(target), elf_machine(staged.path())) {
+            (Some(installed), Some(new)) => ensure!(
+                installed == new,
+                "the new program is for a different CPU architecture than the installed one"
+            ),
+            (_, None) => bail!("the new file is not a Linux program"),
+            _ => {}
+        }
+        host.check_configs()
+            .context("the installed program cannot read a saved tunnel; nothing was changed")?;
     }
     let running = if options.no_restart {
         Vec::new()
@@ -758,6 +783,16 @@ fn perform_with_recorder(
             restarted: running,
         });
     }
+    if is_rollback {
+        // The previous dedicated rollback left the recovered executable in
+        // place and reported a restart failure. Do not reinstall the possibly
+        // broken current executable merely because a tunnel failed to start.
+        finish_history();
+        bail!(
+            "rollback installed {new_version}, but these tunnels did not recover: {}; inspect the update log",
+            failed.join(", ")
+        );
+    }
     say(&format!(
         "Not up after the update: {}. Putting {old_version} back.",
         failed.join(", ")
@@ -779,15 +814,9 @@ fn perform_with_recorder(
 
 /// Rollback uses the same staged, checksummed transaction as an update.
 pub fn rollback(host: &dyn Host, target: &Path, options: &Options) -> Result<Outcome> {
-    let previous = previous_path(target);
-    ensure!(
-        previous.try_exists().context("inspect previous program for rollback")?,
-        "there is no previous program ({} is missing)",
-        previous.display()
-    );
     perform(
         host,
-        &previous,
+        &previous_path(target),
         target,
         &Options {
             allow_downgrade: true,
@@ -1353,6 +1382,8 @@ mod tests {
         /// Tunnels that do not stay up while this program content is installed.
         broken_with: HashMap<String, String>,
         configs_ok: bool,
+        /// Executables whose --version cannot run (e.g. a damaged installation).
+        cannot_run: Vec<String>,
         /// Versions that cannot read a saved tunnel (checked against the program passed to
         /// `check_configs_as`, for example the older binary a rollback is about to switch to).
         unreadable_by: Vec<String>,
@@ -1373,6 +1404,10 @@ mod tests {
         fn version(&self, program: &Path) -> Result<String> {
             let version = version_in(program);
             ensure!(!version.is_empty(), "empty program");
+            ensure!(
+                !self.cannot_run.contains(&version),
+                "simulated --version execution failure for {version}"
+            );
             Ok(version)
         }
         fn running_tunnels(&self) -> Result<Vec<String>> {
@@ -1432,6 +1467,7 @@ mod tests {
             running: running.iter().map(|n| n.to_string()).collect(),
             broken_with: HashMap::new(),
             configs_ok: true,
+            cannot_run: Vec::new(),
             unreadable_by: Vec::new(),
             target: target.to_path_buf(),
             restarts: RefCell::new(Vec::new()),
@@ -1615,6 +1651,145 @@ mod tests {
     
 
     
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollback_acquires_the_update_lock_before_examining_backup_history() {
+        let (_directory, target, _) = setup("0.9.3", "0.9.4");
+        // A concurrent updater may temporarily hold .previous under .keep.
+        // Rollback should report the busy updater, not a missing backup.
+        let held = UpdateLock::acquire(&target).unwrap();
+        let error = rollback(&Tripwire, &target, &NORMAL).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("another update or rollback is in progress"),
+            "{error:#}"
+        );
+        drop(held);
+        let missing = rollback(&Tripwire, &target, &NORMAL).unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("there is no previous program"),
+            "{missing:#}"
+        );
+    }
+
+    #[test]
+    fn emergency_rollback_recovers_when_current_executable_cannot_run() {
+        let (_directory, target, _) = setup("0.9.3", "0.9.4");
+        let broken_current = std::fs::read(&target).unwrap();
+        let healthy_previous = program("0.9.2", "known-good");
+        std::fs::write(previous_path(&target), &healthy_previous).unwrap();
+        record_previous(&target).unwrap();
+        let mut host = fake(&target, &["alpha"]);
+        host.cannot_run.push("0.9.3".into());
+
+        assert_eq!(
+            rollback(&host, &target, &NORMAL).unwrap(),
+            Outcome::Updated {
+                from: "unknown".into(),
+                to: "0.9.2".into(),
+                restarted: vec!["alpha".into()],
+            }
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), healthy_previous);
+        assert_eq!(std::fs::read(previous_path(&target)).unwrap(), broken_current);
+        ensure_rollback_trusted(&target, &broken_current).unwrap();
+        assert_eq!(*host.prepared.borrow(), ["0.9.2"]);
+        assert_eq!(*host.restarts.borrow(), ["alpha"]);
+        assert!(!keep_path(&previous_path(&target)).exists());
+        assert!(!kept_previous_hash_path(&target).exists());
+    }
+
+    #[test]
+    fn emergency_rollback_uses_previous_config_parser_not_broken_current_parser() {
+        let (_directory, target, _) = setup("0.9.3", "0.9.4");
+        let healthy_previous = program("0.9.2", "known-good");
+        std::fs::write(previous_path(&target), &healthy_previous).unwrap();
+        record_previous(&target).unwrap();
+        let mut host = fake(&target, &[]);
+        host.configs_ok = false;
+
+        let result = rollback(&host, &target, &NORMAL).unwrap();
+        assert_eq!(
+            result,
+            Outcome::Updated {
+                from: "0.9.3".into(),
+                to: "0.9.2".into(),
+                restarted: vec![],
+            }
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), healthy_previous);
+        ensure_rollback_trusted(
+            &target,
+            &std::fs::read(previous_path(&target)).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn emergency_rollback_replaces_an_unreadable_current_elf_header() {
+        let (_directory, target, _) = setup("0.9.3", "0.9.4");
+        let broken_current = b"damaged binary bytes".to_vec();
+        std::fs::write(&target, &broken_current).unwrap();
+        let healthy_previous = program("0.9.2", "known-good");
+        std::fs::write(previous_path(&target), &healthy_previous).unwrap();
+        record_previous(&target).unwrap();
+        let host = fake(&target, &[]);
+        let result = rollback(&host, &target, &NORMAL).unwrap();
+        assert!(matches!(result, Outcome::Updated { ref from, .. } if from == "unknown"));
+        assert_eq!(std::fs::read(&target).unwrap(), healthy_previous);
+        assert_eq!(std::fs::read(previous_path(&target)).unwrap(), broken_current);
+        ensure_rollback_trusted(&target, &broken_current).unwrap();
+    }
+
+    #[test]
+    fn emergency_rollback_rejects_invalid_previous_checksum_even_if_current_is_broken() {
+        let (_directory, target, _) = setup("0.9.3", "0.9.4");
+        let broken_current = std::fs::read(&target).unwrap();
+        let healthy_previous = program("0.9.2", "known-good");
+        std::fs::write(previous_path(&target), &healthy_previous).unwrap();
+        record_previous(&target).unwrap();
+        let mut altered = healthy_previous;
+        altered.push(b'!');
+        std::fs::write(previous_path(&target), &altered).unwrap();
+        let mut host = fake(&target, &[]);
+        host.cannot_run.push("0.9.3".into());
+
+        let error = rollback(&host, &target, &NORMAL).unwrap_err();
+        assert!(format!("{error:#}").contains("recorded checksum"), "{error:#}");
+        assert_eq!(std::fs::read(&target).unwrap(), broken_current);
+        assert_eq!(std::fs::read(previous_path(&target)).unwrap(), altered);
+        assert!(host.prepared.borrow().is_empty());
+    }
+
+    #[test]
+    fn failed_emergency_rollback_restart_keeps_the_restored_executable() {
+        let (_directory, target, _) = setup("0.9.3", "0.9.4");
+        let broken_current = std::fs::read(&target).unwrap();
+        let healthy_previous = program("0.9.2", "known-good");
+        std::fs::write(previous_path(&target), &healthy_previous).unwrap();
+        record_previous(&target).unwrap();
+        let mut host = fake(&target, &["alpha"]);
+        host.cannot_run.push("0.9.3".into());
+        host.broken_with.insert("alpha".into(), "0.9.2".into());
+        let error = rollback(&host, &target, &NORMAL).unwrap_err();
+        assert!(format!("{error:#}").contains("rollback installed 0.9.2"), "{error:#}");
+        assert_eq!(std::fs::read(&target).unwrap(), healthy_previous);
+        assert_eq!(std::fs::read(previous_path(&target)).unwrap(), broken_current);
+        ensure_rollback_trusted(&target, &broken_current).unwrap();
+        assert_eq!(*host.prepared.borrow(), ["0.9.2"]);
+    }
+
+    #[test]
+    fn regular_update_still_requires_the_installed_program_to_be_runnable() {
+        let (_directory, target, new) = setup("0.9.3", "0.9.4");
+        let original = std::fs::read(&target).unwrap();
+        let mut host = fake(&target, &[]);
+        host.cannot_run.push("0.9.3".into());
+        let error = perform(&host, &new, &target, &NORMAL).unwrap_err();
+        assert!(format!("{error:#}").contains("--version execution failure"), "{error:#}");
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert!(!previous_path(&target).exists());
+    }
 
     #[test]
     fn rollback_swaps_the_two_programs_so_a_second_one_goes_forward() {
