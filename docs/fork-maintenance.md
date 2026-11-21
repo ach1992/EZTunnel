@@ -2,6 +2,14 @@
 
 This repository remains a GitHub fork of [B3hnamR/EZTunnel](https://github.com/B3hnamR/EZTunnel) (AGPL-3.0-only). The separate fork main is the only branch used for our installers, official binaries and updates. The contributor PR at [upstream #2](https://github.com/B3hnamR/EZTunnel/pull/2) stays open and its contributor branch must not be reset or repurposed while the maintainer is reviewing it.
 
+This is a **temporary independent installation channel** while the upstream maintainer
+considers our changes. The intended outcome is a working, single-command fork
+installer and Release, not an ongoing custom signing or distribution system.
+Once a released upstream version contains the needed features and is verified
+on our servers, decide separately when to migrate or retire this fork. Do not
+silently switch the installer to upstream binaries before then.
+
+
 ## Synchronizing upstream
 
 The scheduled/manual **Propose upstream sync** workflow fetches upstream `main`, merges it into an isolated `sync/upstream-<sha>` branch and opens a PR **into our own fork main**. It does not push upstream, force-update main, integrate, publish, or deploy. A merge conflict fails visibly; a human resolves it in a task branch and re-tests rather than discarding either side. It leaves an already-open sync PR alone. Since PRs created with `GITHUB_TOKEN` do not trigger ordinary PR workflows, the sync workflow explicitly dispatches Fork CI for its branch.
@@ -15,6 +23,11 @@ workflow runs from reviewed `main`, builds Linux x86_64 and ARM64 executables,
 packages `eztunnel-linux-<arch>.tar.gz` archives plus `SHA256SUMS`, and
 publishes a versioned GitHub Release. Existing Releases/tags are never overwritten.
 No separate signing key, Actions secret or manual bootstrap is needed.
+A manual workflow dispatch on a **non-main branch** builds test artifacts for
+both CPUs but skips publication. Only an authorized dispatch from reviewed
+\`main\` may publish a public Release. The native GNU/Linux build contract
+and its GLIBC/runtime checks are documented in [architectures.md](architectures.md).
+
 
 Install on each Linux server with the same one-line experience as upstream:
 

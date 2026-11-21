@@ -196,6 +196,7 @@ fn validate_installation_target(target: &Path) -> Result<()> {
         previous_path(target),
         previous_hash_path(target),
         keep_path(&previous_path(target)),
+        kept_previous_hash_path(target),
     ] {
         match std::fs::symlink_metadata(&path) {
             Ok(m) => ensure!(
@@ -367,10 +368,41 @@ fn previous_hash_path(target: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-fn record_previous(target: &Path) {
-    if let Ok(hash) = sha256_hex(&previous_path(target)) {
-        let _ = std::fs::write(previous_hash_path(target), hash);
+fn kept_previous_hash_path(target: &Path) -> PathBuf {
+    let mut path = previous_hash_path(target).into_os_string();
+    path.push(".keep");
+    PathBuf::from(path)
+}
+
+/// Write and sync a fresh checksum before publishing it atomically.
+fn record_previous(target: &Path) -> Result<()> {
+    use std::io::Write;
+    let hash = sha256_hex(&previous_path(target))?;
+    let destination = previous_hash_path(target);
+    let parent = destination.parent().context("missing checksum directory")?;
+    let mut random = [0u8; 16];
+    crate::stealth::random_bytes(&mut random)?;
+    let temporary = parent.join(format!(".eztunnel-hash-{}", hex::encode(random)));
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(hash.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &destination)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
+    result.with_context(|| format!("persist previous-program checksum at {}", destination.display()))
 }
 
 /// A rollback target must match the exact previous executable recorded by this updater.
@@ -538,12 +570,26 @@ fn perform_with_sync(
     host:&dyn Host,candidate:&Path,target:&Path,options:&Options,
     sync_directory:impl FnOnce(&Path)->Result<()>,
 ) -> Result<Outcome> {
+    perform_with_recorder(host, candidate, target, options, sync_directory, record_previous)
+}
+
+fn perform_with_recorder(
+    host: &dyn Host,
+    candidate: &Path,
+    target: &Path,
+    options: &Options,
+    sync_directory: impl FnOnce(&Path) -> Result<()>,
+    record_checksum: impl Fn(&Path) -> Result<()>,
+) -> Result<Outcome> {
     host.validate_target(target)?;
     let _lock = UpdateLock::acquire(target)?;
     let previous = previous_path(target);
-    // Caller explicitly chooses a file or the Dashboard verifies fork SHA256SUMS.
-    // Only this private copy is executed or installed.
+    let is_rollback = candidate == previous;
+    // Authenticate the saved previous program under the same update lock.
     let bytes = read_program(candidate)?;
+    if is_rollback {
+        ensure_rollback_trusted(target, &bytes)?;
+    }
     let staged = Staged::write(&bytes, target)?;
     drop(bytes);
     let new_version = host.version(staged.path()).context("run the new program")?;
@@ -588,61 +634,111 @@ fn perform_with_sync(
         _ => {}
     }
     host.check_configs()
-        .context("the new program cannot read a saved tunnel; nothing was changed")?;
+        .context("the installed program cannot read a saved tunnel; nothing was changed")?;
+    if is_rollback {
+        host.check_configs_as(staged.path())
+            .context("the previous program cannot read a saved tunnel; nothing was changed")?;
+    }
     let running = if options.no_restart {
         Vec::new()
     } else {
         host.running_tunnels()?
     };
-    say(&format!("Updating {old_version} → {new_version}"));
-    // Failed updates must preserve the older program and its recorded checksum.
+    let verb = if is_rollback { "Rolling back" } else { "Updating" };
+    say(&format!("{verb} {old_version} → {new_version}"));
+    // Preserve both parts of the older rollback history using rename, so a
+    // disk-full error cannot prevent recovering the existing checksum.
     let earlier = keep_path(&previous);
-    let had_earlier = previous.exists();
-    let recorded_earlier = match std::fs::read(previous_hash_path(target)) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
+    let hash_path = previous_hash_path(target);
+    let held_hash = kept_previous_hash_path(target);
+    ensure!(
+        !earlier.try_exists()? && !held_hash.try_exists()?,
+        "unfinished updater recovery files exist at {} or {}; inspect them before updating",
+        earlier.display(), held_hash.display()
+    );
+    let had_earlier = previous.try_exists().context("inspect earlier executable")?;
+    let had_hash = hash_path.try_exists().context("inspect earlier checksum")?;
     if had_earlier {
-        std::fs::rename(&previous, &earlier).context("set the earlier backup aside")?;
+        std::fs::rename(&previous, &earlier).context("preserve earlier executable")?;
     }
-    let restore_earlier = || {
-        if had_earlier {
-            let _ = std::fs::rename(&earlier, &previous);
-        } else {
-            let _ = std::fs::remove_file(&previous);
+    if had_hash {
+        if let Err(error) = std::fs::rename(&hash_path, &held_hash) {
+            if had_earlier {
+                if let Err(recovery) = std::fs::rename(&earlier, &previous) {
+                    return Err(anyhow::anyhow!(
+                        "preserving earlier checksum failed: {error}; restoring the earlier executable also failed: {recovery}"
+                    ));
+                }
+            }
+            return Err(error).context("preserve earlier checksum");
         }
-        if let Some(ref bytes) = recorded_earlier {
-            let _ = std::fs::write(previous_hash_path(target), bytes);
-        } else {
-            let _ = std::fs::remove_file(previous_hash_path(target));
+    }
+    let restore_earlier = || -> Result<()> {
+        if had_earlier {
+            std::fs::rename(&earlier, &previous)
+                .context("restore previous executable from earlier backup")?;
+        } else if previous.try_exists().context("inspect uncommitted previous program")? {
+            std::fs::remove_file(&previous).context("remove uncommitted previous program")?;
+        }
+        if had_hash {
+            std::fs::rename(&held_hash, &hash_path)
+                .context("restore earlier checksum metadata")?;
+        } else if hash_path.try_exists().context("inspect uncommitted checksum")? {
+            std::fs::remove_file(&hash_path)
+                .context("remove uncommitted previous-program checksum")?;
+        }
+        std::fs::File::open(target.parent().context("missing updater directory")?)?
+            .sync_all().context("sync restored recovery metadata")?;
+        Ok(())
+    };
+    let recover_error = |error: anyhow::Error, operation: &str| -> anyhow::Error {
+        match restore_earlier() {
+            Ok(()) => error.context(operation.to_string()),
+            Err(recovery) => anyhow::anyhow!(
+                "{operation}: {error:#}; recovering the earlier backup also failed: {recovery:#}. Inspect recovery paths {} and {}",
+                earlier.display(), held_hash.display()
+            ),
         }
     };
     if let Err(error) = replace_file(target, &previous) {
-        restore_earlier();
-        return Err(error.context("keep the installed program as the previous one"));
+        return Err(recover_error(error, "keep the installed program as the previous one"));
     }
-    record_previous(target);
+    if let Err(error) = record_checksum(target) {
+        return Err(recover_error(error, "record the previous-program checksum before installation"));
+    }
     if let Err(error) = host.prepare_state_for(&new_version) {
-        restore_earlier();
-        return Err(error.context("prepare persistent state for the new program"));
+        return Err(recover_error(error, "prepare persistent state for the new program"));
     }
-    if let Err(error) = staged.install(target,sync_directory) {
-        if !staged.installed.get(){
-            restore_earlier();
-            return Err(error.context("install the new program; the old one is unchanged"));
+    if let Err(error) = staged.install(target, sync_directory) {
+        if !staged.installed.get() {
+            return Err(recover_error(error, "install the new program; the old one is unchanged"));
         }
-        // Rename committed: .previous is now the only immediate recovery copy.
-        // Restore it before housekeeping; if restoration fails keep both history
-        // files and report the ambiguous installation for explicit recovery.
-        if let Err(restore)=replace_file(&previous,target){
-            return Err(anyhow::anyhow!("New program was installed but final synchronization failed: {error:#}. Automatic restore failed: {restore:#}. Recovery files were retained at {} and {}",previous.display(),earlier.display()));
+        if let Err(restore) = replace_file(&previous, target) {
+            return Err(anyhow::anyhow!(
+                "The new program was installed but synchronization failed: {error:#}. Restoring the original program also failed: {restore:#}. Recovery files retained at {} and {}",
+                previous.display(), earlier.display()
+            ));
         }
-        restore_earlier();
-        return Err(error.context("installation finalization failed after replacement; the previous program was restored"));
+        return Err(recover_error(
+            error,
+            "installation finalization failed after replacement; the previous program was restored",
+        ));
     }
+    let finish_history = || {
+        for file in [&earlier, &held_hash] {
+            match file.try_exists() {
+                Ok(true) => {
+                    if let Err(error) = std::fs::remove_file(file) {
+                        say(&format!("Warning: could not clean {}: {error}", file.display()));
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => say(&format!("Warning: cannot inspect {}: {error}", file.display())),
+            }
+        }
+    };
     if running.is_empty() {
-        let _ = std::fs::remove_file(&earlier);
+        finish_history();
         return Ok(Outcome::Updated {
             from: old_version,
             to: new_version,
@@ -655,7 +751,7 @@ fn perform_with_sync(
     ));
     let failed = restart_and_watch(host, &running, target);
     if failed.is_empty() {
-        let _ = std::fs::remove_file(&earlier);
+        finish_history();
         return Ok(Outcome::Updated {
             from: old_version,
             to: new_version,
@@ -669,8 +765,9 @@ fn perform_with_sync(
     host.prepare_state_for(&old_version)
         .context("restore persistent state for the previous program")?;
     replace_file(&previous, target).context("put the previous program back")?;
-    restore_earlier();
+    let history_recovery = restore_earlier();
     let still_failing = restart_and_watch(host, &running, target);
+    history_recovery.context("the original program was restored but backup metadata recovery failed")?;
     if !still_failing.is_empty() {
         bail!(
             "the previous program was restored, but tunnel recovery failed: {}; inspect the update log",
@@ -680,70 +777,23 @@ fn perform_with_sync(
     Ok(Outcome::RolledBack { failed })
 }
 
-/// Swaps the installed program and the previous one, and restarts the running tunnels.
+/// Rollback uses the same staged, checksummed transaction as an update.
 pub fn rollback(host: &dyn Host, target: &Path, options: &Options) -> Result<Outcome> {
-    host.validate_target(target)?;
-    let _lock = UpdateLock::acquire(target)?;
     let previous = previous_path(target);
     ensure!(
-        previous.exists(),
+        previous.try_exists().context("inspect previous program for rollback")?,
         "there is no previous program ({} is missing)",
         previous.display()
     );
-    // Read once, verify the updater's recorded checksum and stage a private copy.
-    let bytes = read_program(&previous)?;
-    ensure_rollback_trusted(target, &bytes)?;
-    let staged = Staged::write(&bytes, target)?;
-    drop(bytes);
-    let back_to = host
-        .version(staged.path())
-        .context("run the previous program")?;
-    host.check_state_for(&back_to)?;
-    host.check_configs_as(staged.path())
-        .context("the previous program cannot read a saved tunnel; nothing was changed")?;
-    let current = read_program(target)
-        .and_then(|bytes| {
-            let staged_current = Staged::write(&bytes, target)?;
-            host.version(staged_current.path())
-        })
-        .unwrap_or_else(|_| "unknown".into());
-    let running = if options.no_restart {
-        Vec::new()
-    } else {
-        host.running_tunnels()?
-    };
-    // Keep the program being replaced, so a second rollback goes forward again.
-    let mut holding = previous.as_os_str().to_owned();
-    holding.push(".swap");
-    let holding = PathBuf::from(holding);
-    replace_file(target, &holding)?;
-    host.prepare_state_for(&back_to)
-        .context("prepare persistent state for rollback")?;
-    staged.install(target,|directory|{std::fs::File::open(directory)?.sync_all()?;Ok(())})?;
-    std::fs::rename(&holding, &previous)?;
-    // `.previous` is now the program that was just replaced.
-    record_previous(target);
-    say(&format!("Rolled back {current} → {back_to}"));
-    let failed = if running.is_empty() {
-        Vec::new()
-    } else {
-        restart_and_watch(host, &running, target)
-    };
-    if !failed.is_empty() {
-        bail!(
-            "rollback installed {back_to}, but these tunnels did not recover: {}",
-            failed.join(", ")
-        );
-    }
-    Ok(if failed.is_empty() {
-        Outcome::Updated {
-            from: current,
-            to: back_to,
-            restarted: running,
-        }
-    } else {
-        Outcome::RolledBack { failed }
-    })
+    perform(
+        host,
+        &previous,
+        target,
+        &Options {
+            allow_downgrade: true,
+            no_restart: options.no_restart,
+        },
+    )
 }
 
 /// The real machine.
@@ -1115,6 +1165,107 @@ mod tests {
     }
 
     #[test]
+    fn checksum_metadata_write_failure_preserves_current_and_earlier_program() {
+        let (_directory, target, candidate) = setup("0.9.1", "0.9.2");
+        let original = std::fs::read(&target).unwrap();
+        let earlier = program("0.9.0", "earlier");
+        std::fs::write(previous_path(&target), &earlier).unwrap();
+        record_previous(&target).unwrap();
+        let earlier_hash = std::fs::read(previous_hash_path(&target)).unwrap();
+        let options = Options { allow_downgrade: false, no_restart: true };
+        let host = fake(&target, &[]);
+        let error = perform_with_recorder(
+            &host, &candidate, &target, &options,
+            |_| Ok(()),
+            |_| anyhow::bail!("simulated checksum write failure"),
+        ).unwrap_err();
+        assert!(format!("{error:#}").contains("simulated checksum write failure"), "{error:#}");
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert_eq!(std::fs::read(previous_path(&target)).unwrap(), earlier);
+        assert_eq!(std::fs::read(previous_hash_path(&target)).unwrap(), earlier_hash);
+        assert!(!keep_path(&previous_path(&target)).exists());
+        assert!(!kept_previous_hash_path(&target).exists());
+        assert!(host.prepared.borrow().is_empty());
+    }
+
+    #[test]
+    fn checksum_failure_without_prior_history_leaves_no_untracked_backup() {
+        let (_directory, target, candidate) = setup("0.9.1", "0.9.2");
+        let original = std::fs::read(&target).unwrap();
+        let error = perform_with_recorder(
+            &fake(&target, &[]), &candidate, &target,
+            &Options { allow_downgrade: false, no_restart: true },
+            |_| Ok(()), |_| anyhow::bail!("simulated missing disk space"),
+        ).unwrap_err();
+        assert!(format!("{error:#}").contains("simulated missing disk space"), "{error:#}");
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert!(!previous_path(&target).exists());
+        assert!(!previous_hash_path(&target).exists());
+    }
+
+    #[test]
+    fn failed_history_restoration_is_reported_and_held_checksum_is_preserved() {
+        let (_directory, target, candidate) = setup("0.9.1", "0.9.2");
+        let original = std::fs::read(&target).unwrap();
+        let earlier = program("0.9.0", "earlier");
+        std::fs::write(previous_path(&target), &earlier).unwrap();
+        record_previous(&target).unwrap();
+        let original_hash = std::fs::read(previous_hash_path(&target)).unwrap();
+        let error = perform_with_recorder(
+            &fake(&target, &[]), &candidate, &target,
+            &Options { allow_downgrade: false, no_restart: true },
+            |_| Ok(()),
+            |path| {
+                std::fs::create_dir(previous_hash_path(path)).unwrap();
+                anyhow::bail!("simulated checksum error")
+            },
+        ).unwrap_err();
+        assert!(format!("{error:#}").contains("recovering the earlier backup also failed"), "{error:#}");
+        assert!(format!("{error:#}").contains("restore earlier checksum metadata"), "{error:#}");
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert_eq!(std::fs::read(previous_path(&target)).unwrap(), earlier);
+        assert_eq!(std::fs::read(kept_previous_hash_path(&target)).unwrap(), original_hash);
+    }
+
+    #[test]
+    fn checksum_failure_before_rollback_preserves_the_original_rollback_record() {
+        let (_directory, target, _candidate) = setup("0.9.2", "0.9.3");
+        let current = std::fs::read(&target).unwrap();
+        let previous = program("0.9.1", "previous");
+        std::fs::write(previous_path(&target), &previous).unwrap();
+        record_previous(&target).unwrap();
+        let previous_hash = std::fs::read(previous_hash_path(&target)).unwrap();
+        let source = previous_path(&target);
+        let error = perform_with_recorder(
+            &fake(&target, &[]), &source, &target,
+            &Options { allow_downgrade: true, no_restart: true },
+            |_| Ok(()),
+            |_| anyhow::bail!("rollback checksum storage unavailable"),
+        ).unwrap_err();
+        assert!(format!("{error:#}").contains("rollback checksum storage unavailable"), "{error:#}");
+        assert_eq!(std::fs::read(&target).unwrap(), current);
+        assert_eq!(std::fs::read(&source).unwrap(), previous);
+        assert_eq!(std::fs::read(previous_hash_path(&target)).unwrap(), previous_hash);
+        ensure_rollback_trusted(&target, &previous).unwrap();
+        assert!(!keep_path(&source).exists());
+        assert!(!kept_previous_hash_path(&target).exists());
+    }
+
+    #[test]
+    fn a_failed_atomic_checksum_publish_does_not_modify_existing_metadata() {
+        let (_directory, target, _) = setup("0.9.1", "0.9.2");
+        std::fs::write(previous_path(&target), program("0.9.0", "earlier")).unwrap();
+        std::fs::create_dir(previous_hash_path(&target)).unwrap();
+        let error = record_previous(&target).unwrap_err();
+        assert!(format!("{error:#}").contains("persist previous-program checksum"), "{error:#}");
+        assert!(previous_hash_path(&target).is_dir());
+        assert!(has_version(&previous_path(&target), "0.9.0"));
+        for entry in std::fs::read_dir(target.parent().unwrap()).unwrap() {
+            assert!(!entry.unwrap().file_name().to_string_lossy().starts_with(".eztunnel-hash-"));
+        }
+    }
+
+    #[test]
     fn rollback_refuses_an_untracked_previous_program_and_never_runs_it() {
         let (_directory, target, _new) = setup("1.1.0", "1.0.0");
         // A .previous file without a recorded checksum is not an updater-owned backup.
@@ -1133,7 +1284,7 @@ mod tests {
         let (_directory, target, new) = setup("1.0.0", "1.1.0");
         let bytes = std::fs::read(&new).unwrap();
         std::fs::write(previous_path(&target), &bytes).unwrap();
-        record_previous(&target);
+        record_previous(&target).unwrap();
         assert!(ensure_rollback_trusted(&target, &bytes).is_ok());
         let mut swapped = bytes.clone();
         swapped.push(b'!');
@@ -1374,7 +1525,7 @@ mod tests {
         // An earlier update left 0.6.2 as the previous program; a failed update must not lose it.
         let earlier_program = program("0.6.2", "body-earlier");
         std::fs::write(previous_path(&target), &earlier_program).unwrap();
-        record_previous(&target);
+        record_previous(&target).unwrap();
         let earlier_hash = std::fs::read_to_string(previous_hash_path(&target)).unwrap();
         let mut host = fake(&target, &["alpha", "beta"]);
         host.broken_with.insert("beta".into(), "0.7.1".into());
@@ -1478,9 +1629,13 @@ mod tests {
         rollback(&host, &target, &options).unwrap();
         assert!(has_version(&target, "0.7.0"));
         assert!(has_version(&previous_path(&target), "0.7.1"));
+        let first_saved = std::fs::read(previous_path(&target)).unwrap();
+        ensure_rollback_trusted(&target, &first_saved).unwrap();
         assert_eq!(*host.restarts.borrow(), ["alpha"]);
         rollback(&host, &target, &options).unwrap();
         assert!(has_version(&target, "0.7.1"));
+        let second_saved = std::fs::read(previous_path(&target)).unwrap();
+        ensure_rollback_trusted(&target, &second_saved).unwrap();
         // Without a previous program there is nothing to go back to.
         std::fs::remove_file(previous_path(&target)).unwrap();
         assert!(rollback(&host, &target, &options).is_err());

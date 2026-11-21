@@ -1,23 +1,36 @@
 # Linux Architectures
 
-EZTunnel ships full-feature static Linux executables for **x86-64**
-(`x86_64-unknown-linux-musl`) and **ARM64** (`aarch64-unknown-linux-musl`).
-They use the same source, protocol, configuration and six optional transport
-extensions. Browser-compatible TLS, BoringSSL, allocator and crypto are not
-disabled on ARM64. No emulation is required on the destination host.
+## Official fork releases (temporary independent distribution)
 
-The validated x86-64 release is static PIE. The current Rust musl ARM64 target
-produces a fixed-address static ELF (ET_EXEC), not PIE; the release report states
-this difference explicitly. Both have no dynamic loader, no executable stack
-and no writable/executable load segment. No cryptographic/session protection or
-Cortex-A53 linker workaround was disabled. Adding ARM static PIE requires a
-separate supported CRT/link strategy rather than merely changing an ELF flag.
+The `ach1992/EZTunnel` one-line installer downloads the fork's official
+`eztunnel-linux-x86_64.tar.gz` or `eztunnel-linux-aarch64.tar.gz`.
+These **full-featured GNU/Linux builds are dynamically linked**, produced
+natively on Ubuntu 24.04 x86-64 and ARM64 GitHub runners. They are **not**
+the optional static musl binaries documented below.
 
-Select the file matching `uname -m`. `x86_64`/`amd64` means x86-64;
-`aarch64`/`arm64` means ARM64. The installer checks the ELF architecture before
-executing or installing it. The updater also checks architecture, ELF class and
-byte order; an ARM64 executable cannot replace an x86-64 installation or vice
-versa. These checks are distinct from GitHub Release SHA256SUMS verification.
+The compatibility baseline for these artifacts is **glibc 2.39 and the
+standard shared runtime libraries available on Ubuntu 24.04**, on the
+corresponding architecture. Ubuntu 24.04 and newer and Debian 13 are the
+intended system families for this fork; use actual ELF requirements, not
+a hard-coded OS-name prohibition, for other distributions. The build job
+records ELF machine, interpreter, shared libraries and required GLIBC
+symbol versions in the `elf-abi.txt` artifact, checks the ABI against
+Ubuntu 24.04 and runs `eztunnel --version` before publishing. A program
+that cannot start on a target host is rejected by the installer **before**
+it replaces an installed executable. Real cross-distribution and
+two-architecture installation still require post-Release acceptance.
+
+An x86-64 host selects `x86_64`/`amd64`; ARM64 selects
+`aarch64`/`arm64`. Both include browser-compatible TLS and all default
+features. The installer checks ELF architecture and SHA256SUMS.
+
+## Optional static musl builds
+
+The repository also provides separate build scripts for optional static
+`x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` builds.
+They are not used by the fork's GitHub Release workflow. Prior static
+build reports for upstream versions (x86-64 static PIE, ARM64 ET_EXEC)
+describe that separate toolchain, not the present fork Release artifacts.
 
 ## Ordinary Builds
 
@@ -29,9 +42,9 @@ Native/cross musl C, C++ and assembly compilers, CMake and libclang are needed f
 the full default browser-TLS build. Do not use host glibc headers for ARM musl
 bindgen or accidentally link host C++ libraries.
 
-## Validated ARM64 Cross Toolchain
+## Optional ARM64 musl cross-toolchain
 
-The release was built offline on x86-64 using Rust1.98.1, its official ARM64 musl
+The earlier static-musl validation used Rust 1.98.1, its official ARM64 musl
 standard library, Zig0.17.1 C/C++/libc++ sysroot, and LLVM22.1.8 final linker and
 libclang. `scripts/build-aarch64-cross.sh` and `scripts/cross/` record the necessary
 target, header and CMake configuration. Provision tools separately; build scripts
@@ -53,9 +66,9 @@ was removed to make the build pass. The package script reads the binary's ELF
 machine instead of naming it after the build host, and never executes a foreign
 binary while packaging. Runtime license notices are added to each release archive.
 
-## Native And Mixed Validation
+## Historical static-build validation (not current fork Release QA)
 
-Both architectures pass the same 490-test browser-enabled inventory natively.
+Historical upstream static builds passed the same 490-test browser-enabled inventory natively.
 ARM64 validation used private namespaces on an ARM64 host, not QEMU. Kernel/raw/
 TUN/Mirage, browser TLS, direct datagrams, migration, hopping, packet fallback,
 CLI/PTY, wrong-architecture installation and lifecycle tests are included.

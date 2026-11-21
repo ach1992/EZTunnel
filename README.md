@@ -81,7 +81,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ach1992/EZTunnel/main/script
 
 The installer picks the right build for your CPU (x86_64 or ARM64), checks it
 against the release's `SHA256SUMS`, installs `/usr/local/bin/eztunnel` and then opens the manager. It
-never starts, stops or changes existing tunnels.
+never starts, stops or changes existing tunnels. The fork's official binaries target
+GNU/Linux with glibc 2.39 and standard Ubuntu 24.04 shared libraries;
+they are not static musl builds. See [Linux architectures](docs/architectures.md).
 
 <details>
 <summary><b>Prefer to read the installer first, or pin a version?</b></summary>
@@ -606,7 +608,7 @@ The default build includes browser-compatible TLS and needs a C/C++ toolchain, C
 and libclang. `--no-default-features` builds without browser TLS (not full feature
 parity). Releases are validated with Rust 1.98.1.
 
-Static release builds:
+Optional static-musl source builds (not the fork's official GitHub Release assets):
 
 ```bash
 rustup target add x86_64-unknown-linux-musl
