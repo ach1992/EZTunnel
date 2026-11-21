@@ -607,7 +607,10 @@ does not stay up), and restarts the Dashboard and Agent processes. If GitHub is 
 use a proxy: `sudo eztunnel upgrade --proxy socks5h://127.0.0.1:1080`.
 
 Running the installer again also updates the program file and restarts the dashboard and the
-agent, but **not** the tunnels, which keep the old version until you restart them:
+agent, but **not** the tunnels, which keep the old version until you restart them.
+If an active Dashboard/Agent service fails to restart, the installer reports the
+exact service and recovery commands and exits with an error; the installed binary
+and previous-version backup remain available.
 
 ```bash
 sudo systemctl restart eztunnel-NAME.service

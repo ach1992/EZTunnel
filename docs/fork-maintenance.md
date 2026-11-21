@@ -35,13 +35,32 @@ Install on each Linux server with the same one-line experience as upstream:
 bash <(curl -fsSL https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh)
 ```
 
-The installer and built-in `eztunnel upgrade` command download only from the **fork's** GitHub Releases. It validates
-HTTPS, SHA256SUMS, ELF architecture and the executable version, preserves
-the replaced binary and never restarts running tunnels. For a specific tag,
-use `--version v0.12.0-ach.1`. Dashboard official downloads use the same
-HTTPS/checksum model; Agent transfers use authenticated management channels
-and matching SHA256 checks. Manually uploaded programs are an explicitly
-administrator-trusted input, **not** independently authenticated releases.
+Both the **installer** and the built-in `eztunnel upgrade` command download only from
+the **fork's** GitHub Releases, using HTTPS, `SHA256SUMS` and CPU architecture
+checks rather than the upstream release-signature requirement.
+
+- **One-line installer** (`scripts/install-latest.sh`): verifies the executable version,
+  replaces the binary atomically and retains `eztunnel.backup-<sha256>`. When updating
+  an existing system installation, it restarts active Dashboard and Agent services but
+  **does not restart tunnel services**. If an active management service fails to restart,
+  the installer prints its `systemctl` error, shows per-unit recovery commands and
+  exits unsuccessfully, with the new executable and backup preserved.
+  Pin a published fork release using `--version v0.12.0-ach.1`.
+- **Local CLI / manager upgrade** (`sudo eztunnel upgrade` or **Update** in the
+  terminal manager): downloads and verifies the fork release, validates saved
+  configurations, replaces the binary transactionally, restarts previously running
+  tunnels and monitors their recovery. If a tunnel does not recover, the updater
+  attempts to restore the previous executable. Active Dashboard and Agent services
+  are also scheduled to restart.
+
+**Remote maintenance:** restarting a tunnel briefly interrupts its traffic. If
+SSH reaches the server through that tunnel, use a separate connection or console
+before running `eztunnel upgrade`. The one-line installer does not restart tunnels
+but may interrupt Dashboard/Agent management connections while restarting them.
+Dashboard release downloads and authenticated Agent transfers remain available
+in the upstream UI, but Dashboard-initiated binary upgrades are not a required fork
+maintenance workflow. Manually uploaded programs are trusted administrator inputs,
+not independently authenticated releases.
 
 **Trust boundary:** SHA256SUMS detects corrupt or mismatched archives; it does not
 independently authenticate a publisher if the GitHub account serving both
@@ -49,15 +68,12 @@ archives and checksums is compromised. This simplified fork does not claim a
 separate Ed25519 release-signing identity. Tunnel Noise authentication,
 stored keys and paired peer identities remain unchanged.
 
-Updates use private staging, persistent configuration validation and automatic
-rollback when a tunnel fails to recover. Manual rollback requires the exact
-previous executable whose SHA256 was recorded by the updater. The one-line installer restarts active Dashboard and Agent services when replacing the program,
-but never restarts running tunnel services. It keeps a separate
-`eztunnel.backup-<sha256>` for the replaced binary.
-
-**Fork maintenance scope:** maintainers use the one-line installer or the local CLI/manager
-upgrade path. Dashboard-initiated binary upgrades are not a fork acceptance requirement;
-do not add compatibility work or dedicated validation for that workflow.
+The CLI updater uses private staging, persistent configuration validation and
+automatic rollback when a tunnel fails to recover. Manual rollback requires the
+exact previous executable whose SHA256 was recorded by the updater.
+The installer keeps its separate checksum-named binary backup without
+transactionally restarting tunnels. Do not add compatibility work or dedicated
+validation for Dashboard-initiated binary upgrades.
 
 ## Dashboard domain
 

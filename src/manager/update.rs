@@ -1151,10 +1151,10 @@ pub fn check_latest(proxy: Option<&str>) -> Result<(String, String, bool)> {
     Ok((installed, newest, newer))
 }
 
-/// Downloads an official release for this CPU from GitHub (`version`, or "latest"), checks it the
-/// way the installer does (SHA256SUMS, the program inside the archive, its CPU and its release
-/// signature) and installs it like `eztunnel update`: the running tunnels restart and go back by
-/// themselves if one does not stay up, and the dashboard and the agent restart to run it.
+/// Downloads a fork release for this CPU from GitHub (`version`, or "latest"), checks its
+/// SHA256SUMS, archive executable and CPU architecture, and installs it like `eztunnel update`:
+/// running tunnels restart and revert to the previous executable if one does not recover;
+/// the Dashboard and Agent services also restart to use the new program.
 #[cfg(feature = "dashboard")]
 pub fn download_and_install(version: &str, proxy: Option<&str>, allow_downgrade: bool) -> Result<String> {
     ensure!(super::store::is_root(), "updating changes system files: run it as root");
