@@ -1,10 +1,11 @@
 # Changelog
 
-## 0.13.0-ach.1 (fork release candidate)
+## 0.13.0-ach.1 (2026-11-22)
 
 - Synchronizes upstream EZTunnel 0.13.0 failover, Game datagram fixes, port handling and Dashboard status.
 - Integrates the one-step CLI/manager upgrade with fork-owned releases, checksums, prerelease version ordering and rollback.
 - Retains the fork Fleet CLI/Menu and Dashboard hostname/ACME certificate controls.
+- Installer reports failed active Dashboard/Agent service restarts and preserves the installed executable and previous-version backup; running tunnel units are untouched by the installer.
 
 ## 0.13.0 (2026-11-21)
 
