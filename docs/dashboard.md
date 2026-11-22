@@ -333,9 +333,9 @@ A removed dashboard that kept its data runs again with the same settings and pas
 Uninstalling EZTunnel (**Uninstall** in the main menu) also removes the dashboard's service and asks
 whether to delete its data, and a joined server leaves its dashboard.
 
-After an update, the dashboard and the agents keep running the program they started with until
-they restart: **Restart the dashboard** and, on joined servers, **Restart the agent** on the same
-screen.
+After a completed program update, the Dashboard and Agent services are scheduled to restart
+so they run the new version. If a restart cannot be scheduled, restart the relevant service
+manually on that server. Tunnel services are restarted separately by the updater.
 
 ## Security
 

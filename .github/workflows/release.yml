@@ -118,4 +118,4 @@ jobs:
           (cd release && sha256sum eztunnel-linux-*.tar.gz > SHA256SUMS)
           gh release create "$tag" release/eztunnel-linux-*.tar.gz release/SHA256SUMS \
             --target "$GITHUB_SHA" --title "EZTunnel fork $VERSION" \
-            --notes "ACh fork based on EZTunnel 0.12.0. Source commit: $GITHUB_SHA. Official downloads use HTTPS and SHA256SUMS. Licensed AGPL-3.0-only."
+            --notes "ACh fork based on EZTunnel ${VERSION%%-ach.*}. Source commit: $GITHUB_SHA. Official downloads use HTTPS and SHA256SUMS. Licensed AGPL-3.0-only."

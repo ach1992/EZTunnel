@@ -13,11 +13,11 @@ open_menu=1
 usage() {
   cat <<'HELP'
 EZTunnel GitHub Release installer
-Usage: sudo bash install-latest.sh [--version v0.9.12] [--prefix /usr/local] [--no-menu]
+Usage: sudo bash install-latest.sh [--version v0.12.0-ach.1] [--prefix /usr/local] [--no-menu]
 
 Downloads the matching Linux archive and SHA256SUMS from ach1992/EZTunnel.
 Verifies the archive checksum and ELF CPU before executing the binary.
-Preserves a replaced executable, installs atomically, and never starts services.
+Preserves a replaced executable, installs atomically, and restarts active Dashboard/Agent services after updates.
 Latest means GitHub's latest published non-prerelease, not the newest source tag.
 Run from a terminal as root, it opens the manager when done; --no-menu (or
 EZTUNNEL_NO_MENU=1) only installs.
@@ -36,6 +36,34 @@ ok() { printf '  %s✔%s %s\n' "$c_green$c_bold" "$c_reset" "$*" >&2; }
 note() { printf '    %s%s%s\n' "$c_dim" "$*" "$c_reset" >&2; }
 rule() { printf '  %s%s%s\n' "$c_dim" '────────────────────────────────────────────────────────────' "$c_reset" >&2; }
 die() { printf '\n  %s✘ %s%s\n\n' "$c_red$c_bold" "$*" "$c_reset" >&2; exit 1; }
+
+# Called only after installing an update in /usr/local/bin. Keep the normal
+# systemctl diagnostic output, attempt both active management units, and report
+# partial success if either restart fails. Tunnel units are never touched here.
+restart_management_services() {
+  local unit rc
+  local -a failed=()
+  for unit in eztunnel-dashboard.service eztunnel-agent.service; do
+    if ! systemctl is-active --quiet "$unit"; then
+      continue
+    fi
+    if systemctl restart "$unit"; then
+      ok "Restarted ${unit%.service} so it runs $new_version"
+    else
+      rc=$?
+      printf '  Failed to restart %s (systemctl exit %s).\n' "$unit" "$rc" >&2
+      failed+=("$unit")
+    fi
+  done
+  if (( ${#failed[@]} > 0 )); then
+    for unit in "${failed[@]}"; do
+      note "Inspect: sudo systemctl status $unit --no-pager"
+      note "Logs:    sudo journalctl -u $unit -n 50 --no-pager"
+      note "Retry:   sudo systemctl restart $unit"
+    done
+    return 1
+  fi
+}
 
 while (( $# )); do
   case $1 in
@@ -56,7 +84,7 @@ case $(uname -m) in
   aarch64|arm64) architecture=aarch64; machine_expected='183 0' ;;
   *) die 'Supported CPUs: x86-64 and ARM64 (aarch64).' ;;
 esac
-[[ $version == latest || $version =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || die 'Use latest or an explicit version tag, for example v0.9.12.'
+[[ $version == latest || $version =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || die 'Use latest or an explicit version tag, for example v0.12.0-ach.1.'
 [[ $prefix == /* && $prefix != / && $prefix != *[[:cntrl:]]* && $prefix != *'"'* && $prefix != *'$'* && $prefix != *'\'* ]] || die 'Use an absolute installation prefix without control characters, quotes, $ or backslashes.'
 if (( EUID != 0 )) && [[ $prefix == /usr/local ]]; then
   die 'Run with sudo to install in /usr/local, or set --prefix "$HOME/.local".'
@@ -165,10 +193,24 @@ else
   ok "Updated $old_version → $c_bold$new_version$c_reset at $destination/eztunnel"
 fi
 [[ -z $backup ]] || note "Previous program kept as $backup"
+# The installer never restarts tunnel services. An active Dashboard/Agent
+# service must restart successfully or the installation reports partial success.
+restart_failed=0
+if [[ -n $old_version && $destination == /usr/local/bin ]]; then
+  if command -v systemctl >/dev/null 2>&1; then
+    restart_management_services || restart_failed=1
+  else
+    note 'systemctl is unavailable; active management services could not be checked or restarted.'
+  fi
+fi
 rule
-note 'Tunnel settings, keys, firewall rules and services were not changed.'
-[[ -z $old_version ]] || note 'Running tunnels keep their current program until you restart them.'
+note 'Tunnel settings, keys, firewall rules and tunnel services were not changed.'
+[[ -z $old_version ]] || note 'Running tunnels keep their current program until you restart them (Manage tunnels → All tunnels → Restart).'
+[[ -z $old_version ]] || note 'Next time: sudo eztunnel upgrade, or Update in the manager, does it all in one step.'
 note 'Checksums catch corruption; HTTPS and the GitHub release are the trust boundary.'
+if (( restart_failed )); then
+  die "EZTunnel $new_version was installed at $destination/eztunnel and the previous executable was kept, but an active management service failed to restart. See the unit-specific errors and recovery commands above."
+fi
 
 menu_command="sudo $destination/eztunnel"
 [[ $prefix != /usr/local ]] || menu_command='sudo eztunnel'

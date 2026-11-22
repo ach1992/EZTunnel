@@ -28,6 +28,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.88.0
+      - run: bash scripts/test-installer-services.sh
       - run: cargo test --locked --no-default-features --features dashboard --lib
       - run: cargo test --locked --no-default-features --features dashboard --test fleet_cli
       - run: cargo check --locked --no-default-features

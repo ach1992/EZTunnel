@@ -1,11 +1,11 @@
 > **ACh-maintained fork.** We maintain our Fleet CLI/Menu and Dashboard domain controls while the [upstream contribution](https://github.com/B3hnamR/EZTunnel/pull/2) remains under review. Fork releases, installers and program updates come exclusively from [ach1992/EZTunnel](https://github.com/ach1992/EZTunnel). See [fork maintenance](docs/fork-maintenance.md) for upstream sync, release downloads and maintenance procedures. Original upstream attribution is preserved below. Do not run the upstream installer to update a fork installation.
 
 <p align="center">
-  <img src="docs/assets/banner.svg?v=0.12.0" alt="EZTunnel: encrypted tunnels, made simple" width="100%">
+  <img src="docs/assets/banner.svg?v=0.13.0" alt="EZTunnel: encrypted tunnels, made simple" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://github.com/ach1992/EZTunnel/releases"><img src="https://img.shields.io/badge/release-fork-00afff?style=for-the-badge" alt="Release v0.12.0-ach.1"></a>
+<a href="https://github.com/ach1992/EZTunnel/releases"><img src="https://img.shields.io/badge/release-fork-00afff?style=for-the-badge" alt="Fork releases"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-875fff?style=for-the-badge" alt="License: AGPL-3.0"></a>
   <img src="https://img.shields.io/badge/built_with-Rust-dea584?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust">
   <img src="https://img.shields.io/badge/Linux-x86__64%20%7C%20ARM64-0087ff?style=for-the-badge&logo=linux&logoColor=white" alt="Linux x86_64 and ARM64">
@@ -38,18 +38,20 @@ config files to write.
   goes to the peers and targets you configure; explicit Release downloads and optional
   certificate issuance contact GitHub and your certificate authority.
 
-## What's new in 0.12.0
+## What's new in 0.13.0
 
-- **Presets** for every transport: Balanced, Many users, Gaming / low delay, Streaming / big
-  downloads and Max capacity. Apply one from the manager, the dashboard or `eztunnel preset`, and
-  see every value it changes first. [Configuration guide](docs/configuration.md)
-- **Automatic connection pool**: each tunnel opens several sessions by default and adds more
-  under load, up to `connection_pool_max`. The peer needs no change.
-- **Faster defaults**: a larger stream window, single-write XHTTP chunks and batched packet-up
-  uploads. The default `kcp.mtu` is now 1350, so update both ends of a KCP tunnel together.
-- **Dashboard**: rename servers, cancel Path Finder, filter connection-test results, safer
-  two-server deletes, clearer error causes and a compact Alerts history.
-  [Dashboard guide](docs/dashboard.md)
+- **Failover**: one tunnel with 2 to 4 transports behind the same user ports, for example TCP,
+  then WSS, then XHTTPS. All of them stay connected; if the one in use goes down or works badly,
+  new users move to the next one within about 20 seconds, and back once the first one has worked
+  for 5 minutes. Pick **Failover** in the transport list of the manager or the dashboard, or create
+  one from the best results of a connection test. [Failover](docs/configuration.md#failover)
+- **Alerts and status** show which transport a failover tunnel uses and when one goes down, also
+  on Telegram.
+- **One-step updates**: **Update** in the manager's main menu, or `sudo eztunnel upgrade`, gets the
+  newest fork release from GitHub, checks its SHA256 checksum and installs it. The dashboard and the agent now restart
+  after every update, so they show and run the new version.
+- **Free ports everywhere**: every port the manager and the dashboard suggest is free, and a port
+  already in use is named with a free one to take instead.
 
 Earlier releases are listed in the [changelog](CHANGELOG.md).
 
@@ -93,7 +95,7 @@ they are not static musl builds. See [Linux architectures](docs/architectures.md
 curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh
 less install-eztunnel.sh
 sudo bash install-eztunnel.sh                      # latest release
-sudo bash install-eztunnel.sh --version v0.12.0-ach.1  # a specific fork release
+sudo bash install-eztunnel.sh --version v0.12.0-ach.1  # pin a published fork release
 sudo bash install-eztunnel.sh --no-menu            # install only, do not open the manager
 ```
 
@@ -527,11 +529,88 @@ Each tunnel is one private JSON file in `/etc/eztunnel/tunnels/` and one systemd
 service named `eztunnel-NAME.service`. Keep configs, backups and codes private.
 
 <details>
+<summary><b>Presets: what each one changes</b></summary>
+
+Apply a preset from **Manage tunnels → Apply a preset**, the dashboard's edit screen, or
+`eztunnel preset FILE [NAME] [--write]`. It shows every change before saving. Use the same preset
+on both servers. A preset never changes ports, the traffic limit, the schedule or the traffic shape.
+
+| Preset | Use it when |
+|---|---|
+| **Balanced** (recommended) | Most links. Good speed with default limits. |
+| **Many users** | Many people share the tunnel at once. |
+| **Gaming / low delay** | Steady low delay and fast detection of a dead link matter more than top speed. |
+| **Streaming / big downloads** | A few users need fast single downloads. |
+| **Max capacity** | A dedicated server. Limits follow its memory and CPU cores instead of fixed numbers. |
+
+In the tables, "No preset" is the default and "–" means the preset keeps the default.
+
+**Sessions (connection pool)**
+
+| Transport | No preset | Balanced | Many users | Gaming | Streaming | Max capacity |
+|---|---|---|---|---|---|---|
+| TCP, HTTP(S), WS(S), XHTTP(S) | 6 | 6 | 9 | 4 | 8 | 6–12 (one per core, at least 6) |
+| KCP, FEC-UDP, Parallax | 3 | 3 | 4 | 3 | 4 | 3–6 (one per core, at least 3) |
+| Mirage, FEC-RAW, TUN | 1 | 1 | 1 | 1 | 1 | 1 |
+
+**Settings for every transport**
+
+| Setting | No preset | Balanced | Many users | Gaming | Streaming | Max capacity |
+|---|---|---|---|---|---|---|
+| Stream window (per user connection) | 128 frames (2 MiB) | – | – | **64** (1 MiB) | **256** (4 MiB) | **256** (4 MiB) |
+| User connections in total (`max_streams`) | 1024 | – | **8192** | – | – | **memory in MB × 16** (1024–65536) |
+| User connections per IP | 512 | – | **8192** | – | – | same as in total |
+| Tunnel sessions accepted (`max_connections`) | 16 | – | **64** | – | – | **cores × 16** (16–1024) |
+| Worker threads | 1 | – | **cores** (up to 8) | – | – | **cores** (up to 64) |
+| Session queue | 128 frames | – | **512** | – | – | **1024** |
+| Memory for windows | automatic | – | – | – | – | **half of the memory** |
+| Open files limit | automatic | – | – | – | – | **user connections × 2 + 4096** |
+| Heartbeat | 10 s | – | – | **5 s** | – | – |
+| Dead link after | 40 s | – | – | **20 s** | – | – |
+| No-answer check | 3 s | – | – | **2 s** | – | – |
+
+**Extra settings by transport**
+
+| Transport | Setting | No preset | Balanced | Many users | Gaming | Streaming | Max capacity |
+|---|---|---|---|---|---|---|---|
+| FEC-UDP, FEC-RAW, Mirage, Parallax packet | FEC send / receive window | 1024 / 1024 | **2048 / 2048** | – | – | **2048 / 2048** | **2048 / 2048** |
+| FEC-UDP, FEC-RAW, Mirage, Parallax packet | FEC socket buffer | 4 MiB | – | – | – | – | **8 MiB** |
+| FEC-UDP, FEC-RAW, Mirage, Parallax packet | Peers per IP | 64 | – | **1024** | – | – | **4096** |
+| XHTTP(S) | Upload requests at once | 8 | – | – | – | **16** | **16** |
+| XHTTP(S) | Requests in total / per IP | 256 / 64 | – | **4096 / 4096** | – | – | **= user connections** |
+| XHTTP(S) | Sessions | 64 | – | **512** | – | – | **cores × 64** |
+| KCP | Sessions in total / per IP | 1024 / 64 | – | **8192 / 1024** | – | – | **= user connections** |
+| Parallax (stream mode) | Buffer | 64 KiB | – | – | – | **512 KiB** | – |
+| Parallax (stream mode) | Sessions | 64 | – | **512** | – | – | **4096** |
+
+**Max capacity on two example servers**
+
+| Server | Memory for windows | User connections | Tunnel sessions | Threads |
+|---|---|---|---|---|
+| 2 GB memory, 2 cores | 1024 MiB | 32,768 | 32 | 2 |
+| 8 GB memory, 4 cores | 4096 MiB | 65,536 | 64 | 4 |
+
+</details>
+
+<details>
 <summary><b>Updating to a new version</b></summary>
 
-Run the installer again on each server, or use **Tools → Update** or the dashboard's
-**Maintenance** page. The installer replaces the program file but **does not restart** running
-tunnels, so they keep the old version until you restart them:
+The easiest way is **Update** in the manager's main menu, or one command:
+
+```bash
+sudo eztunnel upgrade
+```
+
+It downloads the newest **fork release** for this server's CPU from GitHub, checks its
+SHA256 checksum, installs it, restarts running tunnels (and puts the old version back if one
+does not stay up), and restarts the Dashboard and Agent processes. If GitHub is unreachable,
+use a proxy: `sudo eztunnel upgrade --proxy socks5h://127.0.0.1:1080`.
+
+Running the installer again also updates the program file and restarts the dashboard and the
+agent, but **not** the tunnels, which keep the old version until you restart them.
+If an active Dashboard/Agent service fails to restart, the installer reports the
+exact service and recovery commands and exits with an error; the installed binary
+and previous-version backup remain available.
 
 ```bash
 sudo systemctl restart eztunnel-NAME.service
@@ -566,7 +645,6 @@ Coming next to EZTunnel:
 
 | Feature | What it brings |
 |---|---|
-| **Seamless failover** | Give a tunnel backup routes: another transport, or another foreign server. If the main route fails or slows down, traffic moves to a backup automatically and returns when the main route recovers. The user port never changes, open connections pause for a moment and continue instead of dropping, and game traffic keeps its session. |
 | **Three new anti-censorship transports** | New carriers built to get through heavy filtering where today's transports are blocked or throttled. |
 
 Planned features may change before they ship. Follow the [fork releases](https://github.com/ach1992/EZTunnel/releases) to see them land.
