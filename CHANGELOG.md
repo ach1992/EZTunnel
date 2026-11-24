@@ -1,8 +1,9 @@
 # Changelog
 
-## 0.13.0-ach.2 (unreleased)
+## 0.13.0-ach.2 (2026-11-24)
 
 - Add native Dashboard Let's Encrypt DNS-01 with Cloudflare, including automatic renewal on installations where port 80 is occupied, in Web settings, terminal manager and CLI. Existing HTTP-01 and self-signed modes remain available.
+- Verify Cloudflare renewal credentials before replacing dashboard certificate settings, including when ACME reuses an already-valid authorization. Failed verification preserves the previous selection.
 
 ## 0.13.0-ach.1 (2026-11-22)
 
