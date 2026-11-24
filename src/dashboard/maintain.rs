@@ -307,9 +307,12 @@ pub fn export(store: &Store) -> Result<Value> {
 }
 
 /// Saves the tunnels of a backup; existing ones are kept unless `replace`.
-pub fn import(store: &Store, text: &str, replace: bool) -> Result<Value> {
+pub fn import(
+    store: &Store, text: &str, replace: bool,
+    apply: impl FnMut(&str, &Value, bool) -> Result<()>,
+) -> Result<Value> {
     let tunnels = backup::parse_export(text)?;
-    let report = backup::import(store, &tunnels, replace);
+    let report = backup::import_with(store, &tunnels, replace, apply);
     Ok(json!({
         "imported": report.imported,
         "skipped": report.skipped,

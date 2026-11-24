@@ -145,14 +145,21 @@ on each server. With port forwarding, the same available inner TCP relay port is
 selected on both servers.
 
 The hub inventories both endpoints' interfaces, local addresses, non-default
-routes, TCP sockets and saved tunnel allocations (including stopped tunnels).
-The hub serializes TUN creates and each server rechecks resources under its own
-store-wide allocation lock before saving. Concurrent creates from another hub or
-terminal manager cannot overwrite a reservation; if a resource changed, creation
-fails with a diagnostic and the existing key-guarded pair cleanup removes only
-what this attempt created. External network changes can still make a previously
-saved configuration unusable; inspect its logs and free the conflict before restart.
-No default routes, NAT, forwarding sysctls or broad firewall policy are set up.
+routes, TCP sockets and saved tunnel allocations (including stopped tunnels and
+Game server TCP control listeners). The hub serializes TUN creates; each server
+rechecks resource-changing saves, replacements, imports and undo under its own
+store-wide allocation lock. Ordinary listener changes cannot take another saved
+TUN relay port. An immediate restart/rollback keeps both old and new claims
+protected until recovery completes. Competing resource changes receive a busy
+error and can be retried; changes that keep their claims need no full rescan.
+A deliberate save-only change commits its new claims immediately; later undo
+rechecks the old claims instead of assuming they are still available.
+
+If a resource changed, creation fails with a diagnostic and the existing
+key-guarded pair cleanup removes only what this attempt created. External
+network changes can still make a previously saved configuration unusable;
+inspect its logs and free the conflict before restart. No default routes, NAT,
+forwarding sysctls or broad firewall policy are set up.
 
 For Fleet automation, use the ordinary create JSON form above, with
 `"carry": "tun"` or `"carry": "tun_ports"` and these optional fields:
@@ -173,7 +180,10 @@ the remote firewall permits IP traffic.
 
 **Test peer connectivity** sends up to three ICMP echo requests from the saved
 TUN interface to its configured peer; it tests both managed online endpoints
-when they can be matched unambiguously. On the CLI:
+when they can be matched unambiguously. A dashboard probe is bound to the
+effective endpoint (pair, interface, local/peer addresses and MTU); a changed
+target invalidates pending and displayed results, while routine status
+snapshots preserve them. On the CLI:
 
 ```sh
 sudo eztunnel fleet tool site-link tun_probe --server local

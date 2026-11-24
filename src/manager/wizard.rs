@@ -1858,7 +1858,11 @@ mod tests {
         let (_directory, store) = store_with(&[("a", tun_config(47475))]);
         assert_eq!(free_forwarding_port(&store).unwrap(), 47476);
         // Gaps are filled before counting further up.
-        let (_directory, store) = store_with(&[("a", tun_config(47475)), ("b", tun_config(47477))]);
+        let mut second = tun_config(47477);
+        second["tun"]["name"] = serde_json::json!("ez1");
+        second["tun"]["address"] = serde_json::json!("10.77.0.6");
+        second["tun"]["peer_address"] = serde_json::json!("10.77.0.5");
+        let (_directory, store) = store_with(&[("a", tun_config(47475)), ("b", second)]);
         assert_eq!(free_forwarding_port(&store).unwrap(), 47476);
     }
 }

@@ -177,7 +177,17 @@
   let probeGeneration = 0;
   // Snapshots replace the tunnel object every tick. Reset only when its identity
   // changes, not when fresh traffic or interface state arrives.
-  const probeIdentity = $derived(JSON.stringify([name, server, x?.pair ?? null]));
+  function probeTarget(tunnel) {
+    if (!tunnel?.tun) return null;
+    return { pair: tunnel.pair ?? null, interface: tunnel.tun.interface,
+      address: tunnel.tun.address, peer_address: tunnel.tun.peer_address, mtu: tunnel.tun.mtu };
+  }
+  function targetKey(target) {
+    return target ? JSON.stringify([target.pair, target.interface, target.address,
+      target.peer_address, target.mtu]) : null;
+  }
+  const probeIdentity = $derived(JSON.stringify([name, server, targetKey(probeTarget(x)),
+    tunPeer ? [tunPeer.server, tunPeer.name, targetKey(probeTarget(tunPeer.tunnel))] : null]));
   $effect(() => {
     probeIdentity;
     untrack(() => { probeGeneration++; probeResults = []; probeBusy = false; });
@@ -185,10 +195,10 @@
   async function probeTun() {
     if (probeBusy || pending[busyKey] || !x?.tun) return;
     const generation = ++probeGeneration;
-    const pair = x.pair;
-    const endpoints = [{ server, name, address: x.tun.address, label: t("tunLocalIp") }];
+    const identity = probeIdentity;
+    const endpoints = [{ server, name, address: x.tun.address, target: probeTarget(x), label: t("tunLocalIp") }];
     if (tunPeer?.online) endpoints.push({ server: tunPeer.server, name: tunPeer.name,
-      address: tunPeer.tunnel.tun.address, label: t("tunPeerIp") });
+      address: tunPeer.tunnel.tun.address, target: probeTarget(tunPeer.tunnel), label: t("tunPeerIp") });
     probeBusy = true;
     probeResults = endpoints.map((end) => ({ ...end, waiting: true }));
     await Promise.all(endpoints.map(async (end, i) => {
@@ -198,15 +208,17 @@
       else {
         pending[key] = "tun_probe";
         try {
-          const { status: code, data } = await runTool(end.name, "tun_probe", pair ? { expect_pair: pair } : {}, end.server);
-          if (code === 200) row.result = data;
-          else row.error = data?.detail ?? t("failedShort");
+          const { status: code, data } = await runTool(end.name, "tun_probe", { expect_tun: end.target }, end.server);
+          if (code === 200) {
+            if (targetKey(data?.target) === targetKey(end.target)) row.result = data;
+            else row.error = t("tunProbeChanged");
+          } else row.error = data?.detail ?? t("failedShort");
         } catch { row.error = t("slowShort"); }
         finally { delete pending[key]; }
       }
-      if (generation === probeGeneration) probeResults[i] = row;
+      if (generation === probeGeneration && identity === probeIdentity) probeResults[i] = row;
     }));
-    if (generation === probeGeneration) probeBusy = false;
+    if (generation === probeGeneration && identity === probeIdentity) probeBusy = false;
   }
 
   // Pairing code.

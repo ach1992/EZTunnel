@@ -114,28 +114,48 @@ impl Store {
         serde_json::from_str(&text).with_context(|| format!("tunnel {name} is not valid JSON"))
     }
 
-    /// Checks a configuration the same way the service will, then replaces the tunnel's file.
-    /// The previous version is kept as `NAME.json.bak`.
+    /// Save-only changes commit immediately. A caller that may have to undo a
+    /// failed restart must keep the returned save_change guard instead.
     pub fn save(&self, name: &str, config: &Value) -> Result<()> {
-        let _resources = self.resources_lock()?;
-        self.save_unlocked(name, config)
+        self.save_change(name, config).map(drop)
     }
 
-    /// New tunnels reserve their TUN resources in the saved configuration, under one
-    /// host-wide lock shared by dashboard, terminal manager and imports. The caller holds
-    /// the per-tunnel change lock across service installation.
+    /// New and replacement configurations share exactly the same resource check.
     pub fn save_new(&self, name: &str, config: &Value) -> Result<()> {
+        self.save_checked(name, config, true).map(drop)
+    }
+
+    /// The caller holds the per-tunnel change lock through the entire operation.
+    /// Resource-changing saves keep the host allocation lock until the service
+    /// switches to the new settings or the old settings are restored.
+    pub fn save_change(&self, name: &str, config: &Value) -> Result<SavedChange<'_>> {
+        self.save_checked(name, config, false)
+    }
+
+    fn save_checked(&self, name: &str, config: &Value, new: bool) -> Result<SavedChange<'_>> {
+        use super::tun_resources::Claims;
         check_name(name)?;
-        let _resources = self.resources_lock()?;
-        ensure!(!self.exists(name), "a tunnel named {name} already exists on this server");
+        if new {
+            ensure!(!self.exists(name), "a tunnel named {name} already exists on this server");
+        }
         let parsed = super::plan::check(config)?;
-        let inventory = if parsed.tun.is_some() {
-            super::tun_resources::Inventory::collect(self)?
+        let next = Claims::from_config(&parsed)?;
+        // A damaged file can still be repaired; it cannot exempt unknown live claims.
+        let old = self.read(name).ok()
+            .and_then(|value| serde_json::from_value::<Config>(value).ok())
+            .and_then(|config| Claims::from_config(&config).ok())
+            .unwrap_or_default();
+        let resources = if old != next {
+            let lock = self.resources_lock()?;
+            next.check_replacement(self, name, &old)?;
+            Some(lock)
         } else {
-            super::tun_resources::Inventory::saved_relays(self)?
+            None
         };
-        inventory.check_new(&parsed)?;
-        self.save_unlocked(name, config)
+        let earlier = self.previous_bytes(name);
+        self.save_unlocked(name, config)?;
+        Ok(SavedChange { store: self, name: name.into(), earlier,
+            _resources: resources })
     }
 
     fn save_unlocked(&self, name: &str, config: &Value) -> Result<()> {
@@ -165,35 +185,27 @@ impl Store {
         self.dir().join(format!("{name}.json.bak")).exists()
     }
 
-    /// Puts the previous version back. It is checked like any save, and the version being
-    /// replaced becomes the new previous one, so going back can be undone the same way.
+    /// Undo is a new resource-changing save, not permission to overwrite a
+    /// reservation another tunnel acquired since the previous version was saved.
+    pub fn restore_change(&self, name: &str) -> Result<SavedChange<'_>> {
+        let value = self.read_previous(name)?;
+        self.save_change(name, &value)
+    }
+
+    #[cfg(test)]
     pub fn restore_previous(&self, name: &str) -> Result<()> {
+        self.restore_change(name).map(drop)
+    }
+
+    fn read_previous(&self, name: &str) -> Result<Value> {
         check_name(name)?;
-        let path = self.dir().join(format!("{name}.json.bak"));
-        let text = fs::read_to_string(&path).context("there is no previous version")?;
-        let value: Value =
-            serde_json::from_str(&text).context("the previous version is damaged")?;
-        self.save(name, &value)
+        let text = fs::read_to_string(self.dir().join(format!("{name}.json.bak")))
+            .context("there is no previous version")?;
+        serde_json::from_str(&text).context("the previous version is damaged")
     }
 
-    /// The previous version as it is now, kept across a save that may have to be taken back.
-    pub fn previous_bytes(&self, name: &str) -> Option<Vec<u8>> {
+    fn previous_bytes(&self, name: &str) -> Option<Vec<u8>> {
         fs::read(self.dir().join(format!("{name}.json.bak"))).ok()
-    }
-
-    /// Takes back a save that did not work: the previous version goes back in place and
-    /// `earlier` (the previous version from before that save, if there was one) is the previous
-    /// one again, so the settings that failed are not offered as the version to go back to.
-    pub fn take_back_save(&self, name: &str, earlier: Option<&[u8]>) -> Result<()> {
-        self.restore_previous(name)?;
-        let backup = self.dir().join(format!("{name}.json.bak"));
-        match earlier {
-            Some(bytes) => atomic_private(&backup, bytes).context("keep the earlier previous version"),
-            None => {
-                let _ = fs::remove_file(&backup);
-                Ok(())
-            }
-        }
     }
 
     /// Takes the change lock of a tunnel (held elsewhere: a [`Busy`] error). `wait` blocks until it is free (the terminal manager);
@@ -207,7 +219,9 @@ impl Store {
 
     fn resources_lock(&self) -> Result<ChangeLock> {
         create_private_dir(&self.root)?;
-        Self::lock_path(self.root.join(".tun-resources.lock"), "tunnel resource allocation", true)
+        // A resource-changing terminal edit may be awaiting its recovery choice.
+        // Competing claims must refuse safely rather than wait indefinitely.
+        Self::lock_path(self.root.join(".tun-resources.lock"), "tunnel resource allocation", false)
     }
 
     fn lock_path(path: PathBuf, name: &str, wait: bool) -> Result<ChangeLock> {
@@ -250,11 +264,11 @@ impl Store {
     }
 
     /// Replaces a tunnel with a draft that passed `check_file`.
-    pub fn adopt(&self, name: &str, draft: &Path) -> Result<()> {
+    pub fn adopt(&self, name: &str, draft: &Path) -> Result<SavedChange<'_>> {
         let value: Value = serde_json::from_str(&fs::read_to_string(draft)?)?;
-        self.save(name, &value)?;
+        let change = self.save_change(name, &value)?;
         let _ = fs::remove_file(draft);
-        Ok(())
+        Ok(change)
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
@@ -294,6 +308,34 @@ impl Store {
                     .arg(format!("{SERVICE_USER}:{SERVICE_USER}"))
                     .arg(path)
                     .status();
+            }
+        }
+    }
+}
+
+/// In-process save/restart transaction. No second reservation registry: the
+/// existing allocation lock protects both old and new claims until completion.
+/// Save-only callers drop this immediately; normal undo revalidates claims.
+#[must_use = "keep the save guard until restart or rollback is complete"]
+pub struct SavedChange<'a> {
+    store: &'a Store,
+    name: String,
+    earlier: Option<Vec<u8>>,
+    _resources: Option<ChangeLock>,
+}
+
+impl SavedChange<'_> {
+    /// Restore the exact prior configuration while its claims are still held.
+    /// Keep the guard alive through restarting the restored service.
+    pub fn rollback(&self) -> Result<()> {
+        let value = self.store.read_previous(&self.name)?;
+        self.store.save_unlocked(&self.name, &value)?;
+        let backup = self.store.dir().join(format!("{}.json.bak", self.name));
+        match &self.earlier {
+            Some(bytes) => atomic_private(&backup, bytes).context("keep the earlier previous version"),
+            None => {
+                let _ = fs::remove_file(&backup);
+                Ok(())
             }
         }
     }
@@ -481,17 +523,17 @@ mod tests {
         };
         // First save: no earlier version, so after taking back the failed one there is none.
         store.save("t", &with(7000)).unwrap();
-        let earlier = store.previous_bytes("t");
-        store.save("t", &with(7001)).unwrap();
-        store.take_back_save("t", earlier.as_deref()).unwrap();
+        let change = store.save_change("t", &with(7001)).unwrap();
+        change.rollback().unwrap();
+        drop(change);
         assert_eq!(port(store.path("t")), "192.0.2.1:7000");
         assert!(!store.has_previous("t"));
         // With an earlier version, that one stays the version to go back to.
         store.save("t", &with(7002)).unwrap();
         store.save("t", &with(7003)).unwrap();
-        let earlier = store.previous_bytes("t");
-        store.save("t", &with(7004)).unwrap();
-        store.take_back_save("t", earlier.as_deref()).unwrap();
+        let change = store.save_change("t", &with(7004)).unwrap();
+        change.rollback().unwrap();
+        drop(change);
         assert_eq!(port(store.path("t")), "192.0.2.1:7003");
         assert_eq!(port(store.dir().join("t.json.bak")), "192.0.2.1:7002");
     }

@@ -3371,7 +3371,21 @@ mod tests {
         assert!(!tunnel_names(&state).await.contains(&"conflict".into()));
         let probe = call(&app, with_cookie(post("/api/tunnels/tun-a/tools/tun_probe", "{}", true), &cookie)).await;
         assert_eq!(probe.status(), StatusCode::OK);
-        assert_eq!(json_of(probe).await["demo"], true);
+        let reply = json_of(probe).await;
+        assert_eq!(reply["demo"], true);
+        assert_eq!(reply["target"]["peer_address"], reply["peer"]);
+        let exact = json!({"expect_tun": reply["target"]});
+        let request = with_cookie(post("/api/tunnels/tun-a/tools/tun_probe", &exact.to_string(), true), &cookie);
+        let exact_reply = call(&app, request).await;
+        assert_eq!(exact_reply.status(), StatusCode::OK);
+        assert_eq!(json_of(exact_reply).await["target"], exact["expect_tun"]);
+        for (field, changed) in [("interface", json!("other")), ("address", json!("10.2.3.4")),
+            ("peer_address", json!("10.2.3.5")), ("mtu", json!(1320)), ("pair", Value::Null)] {
+            let mut stale = exact.clone();
+            stale["expect_tun"][field] = changed;
+            let request = with_cookie(post("/api/tunnels/tun-a/tools/tun_probe", &stale.to_string(), true), &cookie);
+            assert_eq!(call(&app, request).await.status(), StatusCode::CONFLICT, "{field}");
+        }
         let wrong = with_cookie(post("/api/tunnels/tun-a/tools/tun_probe", r#"{"expect_pair":"0000000000000000"}"#, true), &cookie);
         assert_eq!(call(&app, wrong).await.status(), StatusCode::CONFLICT);
     }

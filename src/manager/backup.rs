@@ -107,14 +107,26 @@ pub struct Report {
 /// configuration is checked like at start-up before it is saved, and one bad tunnel does not stop
 /// the others.
 pub fn import(store: &Store, tunnels: &[(String, Value)], replace: bool) -> Report {
+    import_with(store, tunnels, replace, |name, config, existing| {
+        if existing { store.save(name, config) } else { store.save_new(name, config) }
+    })
+}
+
+/// Apply each imported configuration under its per-tunnel change lock. Callers
+/// that restart immediately must keep their save guard through that restart.
+pub fn import_with(
+    store: &Store, tunnels: &[(String, Value)], replace: bool,
+    mut apply: impl FnMut(&str, &Value, bool) -> Result<()>,
+) -> Report {
     let mut report = Report::default();
     for (name, config) in tunnels {
         let result = (|| -> Result<bool> {
             let _lock = store.lock(name, false)?;
-            if store.exists(name) && !replace {
+            let existing = store.exists(name);
+            if existing && !replace {
                 return Ok(false);
             }
-            if store.exists(name) { store.save(name, config)?; } else { store.save_new(name, config)?; }
+            apply(name, config, existing)?;
             Ok(true)
         })();
         match result {

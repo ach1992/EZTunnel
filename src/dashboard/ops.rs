@@ -111,8 +111,8 @@ pub trait Ops: Send + Sync {
         bail!("this server does not support dashboard TUN setup")
     }
     /// A bounded probe of the saved tunnel's own peer, never a caller-supplied address.
-    fn tun_probe(&self, name: &str, pair: Option<&str>) -> Result<serde_json::Value> {
-        let _ = (name, pair);
+    fn tun_probe(&self, name: &str, pair: Option<&str>, expected: Option<&serde_json::Value>) -> Result<serde_json::Value> {
+        let _ = (name, pair, expected);
         bail!("this server does not support TUN peer testing")
     }
     /// Blocking: the running tunnel's own figures (its control socket's status answer).
@@ -207,7 +207,8 @@ pub fn answer(ops: &dyn Ops, request: &serde_json::Value) -> Result<serde_json::
                 Some(value) => Some(value.as_str().filter(|p| valid_pair(p))
                     .context("the expected pair fingerprint is invalid")?),
             };
-            ops.tun_probe(name, pair)
+            let expected = request.get("expect_tun").filter(|value| !value.is_null());
+            ops.tun_probe(name, pair, expected)
         }
         Some("create") => Ok(serde_json::to_value(ops.create(name, &request["config"])?)?),
         Some("status") => ops.status(name),
@@ -410,6 +411,27 @@ fn pair_differs(config: &serde_json::Value, name: &str, pair: &str) -> Option<an
     (!same).then(|| refused("pair_changed", format!("{UNCHANGED}: {name} here is now another tunnel, not the one chosen for deleting")))
 }
 
+/// The effective saved endpoint, not the mutable snapshot object or merely
+/// its key fingerprint. Compare under the tunnel lock before running ping.
+fn checked_probe_target(
+    config: &serde_json::Value,
+    tun: &crate::config::TunConfig,
+    pair: Option<&str>,
+    expected: Option<&serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let actual_pair = super::data::pair_of(config);
+    let target = serde_json::json!({
+        "pair": actual_pair, "interface": tun.name, "address": tun.address,
+        "peer_address": tun.peer_address, "mtu": tun.mtu
+    });
+    if pair.is_some_and(|pair| !actual_pair.as_deref().is_some_and(|now| now.eq_ignore_ascii_case(pair)))
+        || expected.is_some_and(|expected| expected != &target)
+    {
+        return Err(refused("pair_changed", "TUN probe target has changed; refresh the tunnel and try again"));
+    }
+    Ok(target)
+}
+
 impl LocalOps {
     fn install_new(store: &Store, name: &str, install: impl FnOnce() -> Result<()>, remove_service: impl FnOnce() -> Result<()>) -> Result<()> {
         if let Err(error) = install() {
@@ -448,8 +470,7 @@ impl LocalOps {
     /// service, restarts it; if it does not stay up, the previous file goes back.
     fn save_with_revert(store: &Store, name: &str, edited: &serde_json::Value) -> Result<EditOutcome> {
         let had_service = service::state(store, name) != State::NoService;
-        let earlier = store.previous_bytes(name);
-        store.save(name, edited)?;
+        let change = store.save_change(name, edited)?;
         if !store.system || !had_service {
             return Ok(EditOutcome { changed: true, ..EditOutcome::default() });
         }
@@ -457,7 +478,7 @@ impl LocalOps {
         if up {
             return Ok(EditOutcome { changed: true, restarted: true, came_up: Some(true), ..EditOutcome::default() });
         }
-        store.take_back_save(name, earlier.as_deref()).context("put the previous settings back")?;
+        change.rollback().context("put the previous settings back")?;
         let (back_up, _) = Self::restart_saved(store, name);
         Ok(EditOutcome { changed: true, restarted: true, came_up: Some(back_up), reverted: true, detail: problem })
     }
@@ -566,8 +587,7 @@ impl Ops for LocalOps {
             bail!("there is no previous version of this tunnel's settings");
         }
         let had_service = service::state(&store, name) != State::NoService;
-        let earlier = store.previous_bytes(name);
-        store.restore_previous(name)?;
+        let change = store.restore_change(name)?;
         if !store.system || !had_service {
             return Ok(EditOutcome { changed: true, ..EditOutcome::default() });
         }
@@ -577,7 +597,7 @@ impl Ops for LocalOps {
         }
         // The version gone back to does not stay up either: the settings from before the undo
         // return, and the undone version stays the one to go back to.
-        store.take_back_save(name, earlier.as_deref()).context("put the settings from before back")?;
+        change.rollback().context("put the settings from before back")?;
         let (back_up, _) = Self::restart_saved(&store, name);
         Ok(EditOutcome { changed: true, restarted: true, came_up: Some(back_up), reverted: true, detail: problem })
     }
@@ -613,22 +633,20 @@ impl Ops for LocalOps {
         crate::manager::tun_resources::Inventory::collect(&store)
     }
 
-    fn tun_probe(&self, name: &str, pair: Option<&str>) -> Result<serde_json::Value> {
+    fn tun_probe(&self, name: &str, pair: Option<&str>, expected: Option<&serde_json::Value>) -> Result<serde_json::Value> {
         let store = Self::store()?;
         let _lock = store.lock(name, false)?;
         Self::known(&store, name)?;
         let saved = store.read(name)?;
-        if let Some(pair) = pair {
-            if let Some(failure) = pair_differs(&saved, name, pair) { return Err(failure); }
-        }
         let config = crate::manager::plan::check(&saved)?;
         let tun = config.tun.as_ref().context("this tunnel does not have a TUN interface")?;
+        let target = checked_probe_target(&saved, tun, pair, expected)?;
         let ready = service::state(&store, name) == State::Running
             && crate::manager::tun_resources::interface_ready(tun)?;
         let peer: std::net::IpAddr = tun.peer_address.parse()?;
         if !ready {
             return Ok(serde_json::json!({"interface_ready": false, "attempted": false,
-                "peer": peer, "reachable": false, "detail": "the configured TUN interface is not ready"}));
+                "target": target, "peer": peer, "reachable": false, "detail": "the configured TUN interface is not ready"}));
         }
         let result = std::process::Command::new("ping")
             .args([if peer.is_ipv4() { "-4" } else { "-6" }, "-n", "-q", "-I", &tun.name,
@@ -636,7 +654,7 @@ impl Ops for LocalOps {
             .output().context("run ping (iputils-ping is required for this test)")?;
         let detail = format!("{} {}", String::from_utf8_lossy(&result.stdout).trim(),
             String::from_utf8_lossy(&result.stderr).trim());
-        Ok(serde_json::json!({"interface_ready": true, "attempted": true, "peer": peer,
+        Ok(serde_json::json!({"interface_ready": true, "attempted": true, "target": target, "peer": peer,
             "reachable": result.status.success(), "detail": detail.trim()}))
     }
 
@@ -670,38 +688,43 @@ impl Ops for LocalOps {
             Some("export") => super::maintain::export(&store),
             Some("import") => {
                 let text = request["text"].as_str().context("the backup is missing")?;
-                // What ran before: a replaced tunnel that was running restarts on its restored
-                // settings; one that was stopped stays stopped. Added tunnels are started.
-                let before: HashMap<String, State> = store
-                    .names()?
-                    .into_iter()
-                    .map(|name| { let state = service::state(&store, &name); (name, state) })
-                    .collect();
-                let mut report = super::maintain::import(&store, text, request["replace"] == true)?;
-                let imported: Vec<String> = report["imported"].as_array().into_iter().flatten()
-                    .filter_map(|n| n.as_str().map(str::to_string)).collect();
                 let mut started = Vec::new();
-                if store.system {
-                    for name in &imported {
-                        let _lock = store.lock(name, false)?;
-                        match before.get(name) {
-                            // Added, or replaced while it ran: on its restored settings now.
-                            None | Some(State::Running) => {
+                let mut report = super::maintain::import(&store, text, request["replace"] == true,
+                    |name, config, existing| {
+                        // Observe state and apply under the same per-tunnel lock. Keep old
+                        // resources reserved until restart/rewrite or its rollback finishes.
+                        if !existing {
+                            store.save_new(name, config)?;
+                            if store.system {
                                 let (up, problem) = Self::restart_saved(&store, name);
                                 started.push(serde_json::json!({"name": name, "came_up": up, "problem": problem}));
                             }
-                            // Saved only, no service: as it was.
-                            Some(State::NoService) => {}
-                            // Stopped: its unit follows the restored file, so a later Start runs
-                            // what the file needs (a privileged port, for example); still stopped.
-                            Some(_) => {
-                                if let Err(error) = service::rewrite(&store, name, &installed_program()) {
-                                    started.push(serde_json::json!({"name": name, "came_up": false, "problem": format!("{error:#}")}));
-                                }
-                            }
+                            return Ok(());
                         }
-                    }
-                }
+                        let previous_state = service::state(&store, name);
+                        if previous_state == State::NoService {
+                            return store.save(name, config);
+                        }
+                        if matches!(previous_state, State::Running | State::Starting) {
+                            let outcome = Self::save_with_revert(&store, name, config)?;
+                            if outcome.reverted {
+                                bail!("imported settings did not start: {}; previous settings restored (running: {})",
+                                    outcome.detail.as_deref().unwrap_or("see the service log"), outcome.came_up == Some(true));
+                            }
+                            started.push(serde_json::json!({"name": name, "came_up": outcome.came_up, "problem": outcome.detail}));
+                            return Ok(());
+                        }
+                        // A stopped service stays stopped. If the unit cannot be rewritten,
+                        // restore its previous file and unit, reporting either failure.
+                        let change = store.save_change(name, config)?;
+                        if let Err(error) = service::rewrite(&store, name, &installed_program()) {
+                            change.rollback().context("restore the settings after failed import")?;
+                            service::rewrite(&store, name, &installed_program())
+                                .context("restore the service unit after failed import")?;
+                            return Err(error.context("imported settings were not applied; previous settings restored"));
+                        }
+                        Ok(())
+                    })?;
                 report["started"] = serde_json::json!(started);
                 Ok(report)
             }
@@ -866,16 +889,15 @@ impl Ops for DemoOps {
         Ok(inventory)
     }
 
-    fn tun_probe(&self, name: &str, pair: Option<&str>) -> Result<serde_json::Value> {
+    fn tun_probe(&self, name: &str, pair: Option<&str>, expected: Option<&serde_json::Value>) -> Result<serde_json::Value> {
         let (_, config) = self.created().into_iter().find(|(n, _)| n == name)
             .context("no saved demo tunnel")?;
-        if let Some(pair) = pair {
-            if let Some(failure) = pair_differs(&config, name, pair) { return Err(failure); }
-        }
-        let tun = config["tun"].as_object().context("this tunnel does not have a TUN interface")?;
+        let tun: crate::config::TunConfig = serde_json::from_value(config["tun"].clone())
+            .context("this tunnel does not have a TUN interface")?;
+        let target = checked_probe_target(&config, &tun, pair, expected)?;
         let ready = self.running(name, true);
         Ok(serde_json::json!({"demo": true, "interface_ready": ready, "attempted": ready,
-            "peer": tun["peer_address"], "reachable": ready, "detail": "simulated demo result"}))
+            "target": target, "peer": tun.peer_address, "reachable": ready, "detail": "simulated demo result"}))
     }
 
     fn create(&self, name: &str, config: &serde_json::Value) -> Result<Outcome> {

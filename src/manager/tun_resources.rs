@@ -1,7 +1,7 @@
 //! Resources of the two TUN endpoints. An inventory contains no keys or full configurations.
 //! Default routes are deliberately ignored: the TUN engine adds only point-to-point host routes.
 use super::{service, store::Store};
-use crate::config::{Config, TunConfig};
+use crate::config::{Config, Mode, TunConfig};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -92,8 +92,13 @@ pub struct Inventory {
 /// Inventory only the information needed for resource allocation, not the contents of the configs.
 impl Inventory {
     pub fn saved(store: &Store) -> Result<Self> {
+        Self::saved_except(store, None)
+    }
+
+    fn saved_except(store: &Store, except: Option<&str>) -> Result<Self> {
         let mut inventory = Self::default();
         for name in store.names()? {
+            if except == Some(name.as_str()) { continue; }
             inventory
                 .add_config(&store.read(&name)?)
                 .with_context(|| format!("read saved resources of {name}"))?;
@@ -104,9 +109,10 @@ impl Inventory {
     /// Ordinary forwarding does not need the complete TUN inventory. Keep its
     /// existing behavior when another configuration is damaged, but honor
     /// every readable saved relay reservation, including stopped tunnels.
-    pub fn saved_relays(store: &Store) -> Result<Self> {
+    fn saved_relays_except(store: &Store, except: &str) -> Result<Self> {
         let mut inventory = Self::default();
         for name in store.names()? {
+            if name == except { continue; }
             if let Ok(value) = store.read(&name)
                 && let Some(port) = value["tun"]["forwarding_port"]
                     .as_u64()
@@ -312,31 +318,88 @@ impl Inventory {
         )
     }
 
-    /// Recheck resources just before the new file is saved under the store-wide allocation lock.
-    pub fn check_new(&self, config: &Config) -> Result<()> {
-        if let Some(tun) = &config.tun {
-            ensure!(
-                !self.interfaces.contains(&tun.name),
-                "TUN interface {} is already in use",
-                tun.name
-            );
-            self.check_pair(tun.address.parse()?, tun.peer_address.parse()?)?;
-            if let Some(port) = tun.forwarding_port {
-                ensure!(
-                    !self.tcp_ports.contains(&port),
-                    "TUN forwarding TCP port {port} is already in use"
-                );
-                ensure!(
-                    !tcp_listeners(config).contains(&port),
-                    "TUN forwarding TCP port {port} conflicts with this tunnel's listener"
-                );
+    /// Recheck resources just before saving under the store-wide allocation lock.
+    /// Old claims may still be live until restart; only additions need a live
+    /// collision check. Saved claims from other tunnels are never excluded.
+    fn check_claims(&self, next: &Claims, old: &Claims, live: bool) -> Result<()> {
+        if let Some(tun) = &next.tun {
+            let previous = old.tun.as_ref();
+            if !live || !previous.is_some_and(|p| p.name == tun.name) {
+                ensure!(!self.interfaces.contains(&tun.name),
+                    "TUN interface {} is already in use", tun.name);
+            }
+            for address in [tun.local, tun.peer] {
+                if !live || !previous.is_some_and(|p| p.local == address || p.peer == address) {
+                    ensure!(!self.occupied(address),
+                        "TUN address {address} overlaps an existing interface, route or saved tunnel");
+                }
+            }
+            if let Some(port) = tun.relay {
+                if !live || !previous.is_some_and(|p| p.relay == Some(port)) {
+                    ensure!(!self.tcp_ports.contains(&port),
+                        "TUN forwarding TCP port {port} is already in use");
+                }
+                ensure!(!next.listeners.contains(&port),
+                    "TUN forwarding TCP port {port} conflicts with this tunnel's listener");
             }
         }
-        for port in tcp_listeners(config) {
-            ensure!(
-                !self.relay_ports.contains(&port),
-                "TCP port {port} is reserved by a saved TUN relay"
-            );
+        for port in &next.listeners {
+            ensure!(!self.relay_ports.contains(port),
+                "TCP port {port} is reserved by a saved TUN relay");
+        }
+        Ok(())
+    }
+
+
+}
+
+/// Only resource-affecting values, not tuning, keys or telemetry. A stopped
+/// tunnel owns exactly the same saved claims as a running one.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Claims {
+    tun: Option<TunClaims>,
+    listeners: BTreeSet<u16>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TunClaims {
+    name: String,
+    local: IpAddr,
+    peer: IpAddr,
+    relay: Option<u16>,
+}
+
+impl Claims {
+    pub(crate) fn from_config(config: &Config) -> Result<Self> {
+        let tun = config.tun.as_ref().map(|tun| -> Result<TunClaims> {
+            Ok(TunClaims { name: tun.name.clone(), local: tun.address.parse()?,
+                peer: tun.peer_address.parse()?, relay: tun.forwarding_port })
+        }).transpose()?;
+        Ok(Self { tun, listeners: tcp_listeners(config) })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Some(tun) = &self.tun {
+            Inventory::default().check_pair(tun.local, tun.peer)?;
+        }
+        Ok(())
+    }
+
+    /// Replacements exclude only their own saved file. A running old interface
+    /// or listener is expected until the service switches to the new file.
+    pub(crate) fn check_replacement(&self, store: &Store, name: &str, old: &Self) -> Result<()> {
+        self.validate()?;
+        let saved = if self.tun.is_some() {
+            Inventory::saved_except(store, Some(name))?
+        } else {
+            Inventory::saved_relays_except(store, name)?
+        };
+        saved.check_claims(self, old, false)?;
+        if store.system && self.tun.is_some() {
+            preflight()?;
+            let mut live = Inventory::default();
+            live.add_host()?;
+            live.check_claims(self, old, true)?;
         }
         Ok(())
     }
@@ -348,6 +411,12 @@ fn tcp_listeners(config: &Config) -> BTreeSet<u16> {
         .filter(|(_, proto)| *proto == "tcp")
         .map(|(port, _)| port)
         .collect();
+    if config.mode == Mode::Server
+        && let Some(bind) = config.gaming.control_address.as_deref()
+        && let Ok(bind) = bind.parse::<SocketAddr>()
+    {
+        ports.insert(bind.port());
+    }
     if let Some(bind) = config
         .socks5
         .as_deref()
@@ -579,6 +648,156 @@ mod tests {
                 .is_err()
         );
         assert_eq!(store.names().unwrap().len(), 2);
+    }
+
+    fn tun_value(index: u8) -> Value {
+        use crate::{config::Transport, manager::plan::{Carry, Direction, Plan, Side, TunPlan},
+            tunnel_key::TunnelKey};
+        let mut plan = Plan::new(TunnelKey::generate().unwrap().display(),
+            Side::Iran, Direction::Reverse, Transport::Tcp);
+        plan.tunnel_port = 25000 + u16::from(index);
+        plan.carry = Carry::TunPorts;
+        plan.ports = crate::manager::plan::parse_ports(&(26000 + u16::from(index)).to_string()).unwrap();
+        plan.tun = Some(TunPlan { name: format!("ez{index}"),
+            local_ip: format!("10.88.{index}.1"), peer_ip: format!("10.88.{index}.2"),
+            mtu: 1400, forwarding_port: Some(47475 + u16::from(index)), fragment: false });
+        plan.to_json().unwrap()
+    }
+
+    fn ordinary_value(port: u16) -> Value {
+        use crate::{config::Transport, manager::plan::{Direction, Plan, Side},
+            tunnel_key::TunnelKey};
+        let mut plan = Plan::new(TunnelKey::generate().unwrap().display(),
+            Side::Iran, Direction::Reverse, Transport::Tcp);
+        plan.ports = crate::manager::plan::parse_ports(&port.to_string()).unwrap();
+        plan.to_json().unwrap()
+    }
+
+    #[test]
+    fn every_replacement_path_checks_other_stopped_claims_and_keeps_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::for_test(root.path().into());
+        let a = tun_value(1);
+        let b = tun_value(2);
+        store.save_new("a", &a).unwrap();
+        store.save_new("b", &b).unwrap();
+        // Test each resource separately so one conflict cannot mask another.
+        for field in ["name", "address", "peer_address", "forwarding_port"] {
+            let mut conflict = b.clone();
+            conflict["tun"][field] = a["tun"][field].clone();
+            let error = store.save("b", &conflict).unwrap_err();
+            assert!(format!("{error:#}").contains("already in use") ||
+                format!("{error:#}").contains("overlaps"), "{field}: {error:#}");
+            assert_eq!(store.read("b").unwrap(), b);
+            assert!(!store.has_previous("b"));
+        }
+        let draft = store.draft("b").unwrap();
+        std::fs::write(&draft, serde_json::to_vec(&a).unwrap()).unwrap();
+        assert!(store.adopt("b", &draft).is_err());
+        assert!(draft.exists(), "a refused draft is retained for correction");
+        let report = crate::manager::backup::import(&store, &[("b".into(), a.clone())], true);
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.imported.is_empty());
+        assert_eq!(store.read("b").unwrap(), b);
+        assert_eq!(store.read("a").unwrap(), a);
+        let ordinary = ordinary_value(27000);
+        store.save_new("ordinary", &ordinary).unwrap();
+        assert!(store.save("ordinary", &ordinary_value(47476)).is_err());
+        assert_eq!(store.read("ordinary").unwrap(), ordinary);
+    }
+
+    #[test]
+    fn unchanged_claims_need_no_inventory_but_undo_of_reassigned_claims_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::for_test(root.path().into());
+        let old = tun_value(3);
+        let mut current = old.clone();
+        store.save_new("a", &old).unwrap();
+        // An unrelated damaged file must not block a non-resource edit.
+        std::fs::write(store.path("damaged"), "{").unwrap();
+        current["tun"]["mtu"] = json!(1320);
+        store.save("a", &current).unwrap();
+        assert_eq!(store.read("a").unwrap(), current);
+        std::fs::remove_file(store.path("damaged")).unwrap();
+        let next = tun_value(4);
+        store.save("a", &next).unwrap();
+        store.save_new("other", &old).unwrap();
+        let backup = std::fs::read(store.path("a").with_extension("json.bak")).unwrap();
+        assert!(store.restore_change("a").is_err());
+        assert_eq!(store.read("a").unwrap(), next);
+        assert_eq!(store.read("other").unwrap(), old);
+        assert_eq!(std::fs::read(store.path("a").with_extension("json.bak")).unwrap(), backup);
+    }
+
+    #[test]
+    fn resource_changing_transaction_reserves_previous_claims_until_rollback_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::for_test(root.path().into());
+        let old = tun_value(5);
+        let next = tun_value(6);
+        store.save_new("a", &old).unwrap();
+        let _lock = store.lock("a", false).unwrap();
+        let change = store.save_change("a", &next).unwrap();
+        // Independent thread/process cannot acquire old OR new claims during recovery.
+        std::thread::scope(|scope| {
+            for (name, config) in [("old", &old), ("new", &next)] {
+                let store = &store;
+                let failed = scope.spawn(move || {
+                    let _lock = store.lock(name, false).unwrap();
+                    store.save_new(name, config)
+                }).join().unwrap();
+                assert!(failed.unwrap_err().downcast_ref::<crate::manager::store::Busy>().is_some());
+            }
+        });
+        change.rollback().unwrap();
+        assert_eq!(store.read("a").unwrap(), old);
+        assert!(!store.has_previous("a"));
+        drop(change);
+        assert!(store.save_new("old", &old).is_err());
+        store.save_new("new", &next).unwrap();
+    }
+
+    #[test]
+    fn live_replacement_checks_new_claims_but_allows_retained_claims() {
+        let old = Claims::from_config(&serde_json::from_value(tun_value(7)).unwrap()).unwrap();
+        let mut candidate = tun_value(7);
+        candidate["tun"]["peer_address"] = json!("10.88.7.3");
+        let next = Claims::from_config(&serde_json::from_value(candidate).unwrap()).unwrap();
+        let mut live = Inventory::default();
+        live.interfaces.insert("ez7".into());
+        live.networks.insert(Network::parse("10.88.7.1").unwrap());
+        live.networks.insert(Network::parse("10.88.7.2").unwrap());
+        live.tcp_ports.insert(47482);
+        live.check_claims(&next, &old, true).unwrap();
+        live.networks.insert(Network::parse("10.88.7.3").unwrap());
+        assert!(live.check_claims(&next, &old, true).is_err());
+    }
+
+    #[test]
+    fn stopped_game_server_control_is_reserved_but_client_dial_target_is_not() {
+        use crate::{config::Transport, manager::plan::{Carry, Direction, GamePlan, Plan, Side},
+            tunnel_key::TunnelKey};
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::for_test(root.path().into());
+        let make = |side, port| {
+            let mut plan = Plan::new(TunnelKey::generate().unwrap().display(),
+                side, Direction::Reverse, Transport::Tcp);
+            plan.carry = Carry::Socks;
+            plan.peer_host = Some("192.0.2.1".into());
+            plan.game = Some(GamePlan { port, copies: 1, iran_host: None });
+            plan.to_json().unwrap()
+        };
+        let server = make(Side::Iran, 47475);
+        let client = make(Side::Foreign, 47476);
+        store.save_new("game-server", &server).unwrap();
+        store.save_new("game-client", &client).unwrap();
+        let inv = Inventory::saved(&store).unwrap();
+        assert_eq!(inv.relay_port(&Inventory::default(), &[]).unwrap(), 47476);
+        let tun = tun_value(1); // relay 47476
+        store.save_new("tun", &tun).unwrap();
+        assert!(store.save_new("another-game", &make(Side::Iran, 47476)).is_err());
+        assert!(store.save("game-server", &make(Side::Iran, 47476)).is_err());
+        assert_eq!(store.read("game-server").unwrap(), server);
     }
 
     #[test]
