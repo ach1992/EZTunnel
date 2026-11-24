@@ -1,9 +1,9 @@
 //! Cloudflare DNS-01: only create and remove the TXT record owned by this order.
 //! Use the dashboard's existing verified HTTPS client; no shell commands or extra dependencies.
-use super::{Https, send};
+use bytes::Bytes;
 use anyhow::{Context, Result, bail, ensure};
 use http::{Method, header};
-use instant_acme::BodyWrapper;
+use instant_acme::{BodyWrapper, HttpClient};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ pub(super) fn validate_token(token: &str) -> Result<()> {
     Ok(())
 }
 
-async fn request(method: Method, url: &str, token: Option<&str>, body: Option<Value>) -> Result<(http::StatusCode, Value)> {
+async fn request(client: &dyn HttpClient, method: Method, url: &str, token: Option<&str>, body: Option<Value>) -> Result<(http::StatusCode, Value)> {
     let mut req = http::Request::builder().method(method).uri(url)
         .header(header::ACCEPT, if token.is_some() { "application/json" } else { "application/dns-json" });
     if let Some(token) = token {
@@ -31,8 +31,8 @@ async fn request(method: Method, url: &str, token: Option<&str>, body: Option<Va
         req = req.header(header::CONTENT_TYPE, "application/json");
         serde_json::to_vec(&body)?
     } else { Vec::new() };
-    let req = req.body(BodyWrapper::from(bytes))?;
-    let mut response = send(Https::new()?.tls, req).await?;
+    let req = req.body(BodyWrapper::<Bytes>::from(bytes))?;
+    let mut response = client.request(req).await?;
     let status = response.parts.status;
     let bytes = tokio::time::timeout(Duration::from_secs(30), response.body.into_bytes())
         .await.context("DNS service response timed out")?
@@ -52,8 +52,8 @@ fn result(status: http::StatusCode, body: Value, operation: &str) -> Result<Valu
     bail!("Cloudflare {operation} failed (HTTP {status}, codes {codes:?}); check the API token's Zone Read and DNS Edit access and the challenge record");
 }
 
-async fn api(method: Method, path: &str, token: &str, body: Option<Value>, operation: &str) -> Result<Value> {
-    let (status, response) = request(method, &format!("{API}{path}"), Some(token), body)
+async fn api(client: &dyn HttpClient, method: Method, path: &str, token: &str, body: Option<Value>, operation: &str) -> Result<Value> {
+    let (status, response) = request(client, method, &format!("{API}{path}"), Some(token), body)
         .await.with_context(|| format!("Cloudflare {operation}"))?;
     result(status, response, operation)
 }
@@ -70,9 +70,9 @@ fn zone_candidates(domain: &str) -> impl Iterator<Item = &str> {
         .take_while(|name| name.contains('.'))
 }
 
-async fn zone(domain: &str, token: &str) -> Result<String> {
+async fn zone(client: &dyn HttpClient, domain: &str, token: &str) -> Result<String> {
     for name in zone_candidates(domain) {
-        let zones = api(Method::GET, &format!("/zones?name={name}&status=active"), token, None, "zone lookup").await?;
+        let zones = api(client, Method::GET, &format!("/zones?name={name}&status=active"), token, None, "zone lookup").await?;
         let matches: Vec<_> = zones.as_array().context("Cloudflare returned an invalid zone list")?.iter()
             .filter(|z| z["name"].as_str() == Some(name) && z["status"].as_str() == Some("active")).collect();
         match matches.as_slice() {
@@ -92,17 +92,26 @@ pub(super) struct Challenge {
 }
 
 impl Challenge {
-    pub(super) async fn create(domain: &str, value: String, token: &str) -> Result<Self> {
-        let zone = zone(domain, token).await?;
+    pub(super) async fn create(client: &dyn HttpClient, domain: &str, value: String, token: &str) -> Result<Self> {
+        let zone = zone(client, domain, token).await?;
         let name = format!("_acme-challenge.{domain}");
         let body = json!({"type":"TXT","name":name,"content":format!("\"{value}\""),"ttl":60});
-        let response = api(Method::POST, &format!("/zones/{zone}/dns_records"), token, Some(body), "TXT creation").await
+        let response = api(client, Method::POST, &format!("/zones/{zone}/dns_records"), token, Some(body), "TXT creation").await
             .with_context(|| format!("could not create {name}; if the request was interrupted, inspect that name before retrying"))?;
         let record = id(&response)?.to_owned();
         Ok(Self { zone, record, name, value })
     }
 
-    pub(super) async fn wait(&self) -> Result<()> {
+    /// A cached ACME authorization says nothing about the new renewal token.
+    /// Use the same challenge name and DNS lifecycle with a fresh, unrelated value.
+    pub(super) async fn probe(client: &dyn HttpClient, domain: &str, token: &str) -> Result<Self> {
+        let mut nonce = [0u8; 16];
+        crate::dashboard::random_bytes(&mut nonce)?;
+        Self::create(client, domain, format!("eztunnel-verify-{}", hex::encode(nonce)), token)
+            .await.context("verify Cloudflare renewal credentials")
+    }
+
+    pub(super) async fn wait(&self, client: &dyn HttpClient) -> Result<()> {
         let start = tokio::time::Instant::now();
         let mut observation = "no DNS response yet".to_string();
         loop {
@@ -111,7 +120,7 @@ impl Challenge {
                 bail!("DNS-01 TXT record {} was not visible through public DNS within five minutes ({observation}); check delegation and propagation", self.name);
             }
             let url = format!("{RESOLVER}?name={}&type=TXT", self.name);
-            let lookup = tokio::time::timeout(remaining, request(Method::GET, &url, None, None)).await;
+            let lookup = tokio::time::timeout(remaining, request(client, Method::GET, &url, None, None)).await;
             observation = match lookup {
                 Ok(Ok((status, response))) if status.is_success() && visible(&response, &self.name, &self.value) => return Ok(()),
                 Ok(Ok((status, response))) => format!("HTTP {status}, DNS status {}", response["Status"]),
@@ -122,9 +131,9 @@ impl Challenge {
         }
     }
 
-    pub(super) async fn remove(self, token: &str) -> Result<()> {
+    pub(super) async fn remove(self, client: &dyn HttpClient, token: &str) -> Result<()> {
         let path = format!("/zones/{}/dns_records/{}", self.zone, self.record);
-        api(Method::DELETE, &path, token, None, "TXT cleanup").await
+        api(client, Method::DELETE, &path, token, None, "TXT cleanup").await
             .with_context(|| format!("remove only the temporary TXT record {} (record ID {})", self.name, self.record))?;
         Ok(())
     }

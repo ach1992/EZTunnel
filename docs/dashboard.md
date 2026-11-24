@@ -293,7 +293,11 @@ Issuance and automatic renewal use the same method; neither opens port 80 or cha
 dashboard port, existing A/AAAA/CNAME records, or tunnels. DNS-01 needs a domain (not an IP).
 The token is stored in the dashboard's root-only state along with its certificate configuration
 for renewal and is never returned to the browser. Leave the token field blank to reuse it for
-the same configured domain, or enter a new token to replace it. Keep dashboard state private.
+the same configured domain, or enter a new token to replace it. If Let's Encrypt reuses a valid
+authorization, an explicit certificate request still checks the supplied renewal credential by
+creating, verifying and deleting a unique temporary TXT at the challenge name. A failed check
+leaves the previous certificate and renewal settings unchanged. Scheduled renewals with an
+already-valid authorization need no extra TXT probe. Keep dashboard state private.
 An interrupted request or failed DNS cleanup may leave a temporary TXT record; inspect the
 named record/ID in the dashboard service log before removing it. Other TXT records are not touched.
 DNS delegation must permit writing the challenge TXT record in the Cloudflare zone.

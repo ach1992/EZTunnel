@@ -6,12 +6,14 @@
 //! Validation uses HTTP-01 (a temporary listener on port 80) or Cloudflare DNS-01
 //! (a temporary TXT record; no inbound HTTP listener).
 mod cloudflare;
+#[cfg(test)]
+mod authorization_tests;
 use super::tls::{self, Swap};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::Bytes;
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, BodyWrapper, BytesResponse, ChallengeType,
-    HttpClient, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+    HttpClient, Identifier, LetsEncrypt, NewAccount, NewOrder, Order, OrderStatus, RetryPolicy,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, pem::PemObject};
 use serde::{Deserialize, Serialize};
@@ -360,9 +362,18 @@ fn challenge_answer(answers: &Answers, path: &str) -> Option<String> {
     answers.lock().unwrap().get(token).cloned()
 }
 
+/// Configuration requests must establish that DNS renewal works even if the CA
+/// reuses an authorization. Scheduled renewal never replaces credentials and
+/// need not create an extra record when the authorization is already valid.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum IssuePurpose {
+    Configure,
+    Renew,
+}
+
 /// Orders a certificate for `settings.address` without touching the active certificate.
 /// Persistence is a separate, atomic settings transaction after validation.
-pub async fn issue(state_dir: &Path, settings: &AcmeSettings, port: u16) -> Result<Issued> {
+pub(super) async fn issue(state_dir: &Path, settings: &AcmeSettings, port: u16, purpose: IssuePurpose) -> Result<Issued> {
     settings.validate()?;
     let ip = settings.address.parse::<IpAddr>().ok();
     let identifier = match ip {
@@ -378,54 +389,8 @@ pub async fn issue(state_dir: &Path, settings: &AcmeSettings, port: u16) -> Resu
     }
     let mut order = account.new_order(&new_order).await.context("order the certificate")?;
 
-    let answers: Answers = Arc::default();
-    let token = settings.cloudflare_token.as_deref();
-    let _server = if token.is_none() {
-        Some(ChallengeServer::start(answers.clone(), port, matches!(ip, Some(IpAddr::V6(_)))).await?)
-    } else { None };
-    let mut dns_record = None;
-    let validation = async {
-        let mut authorizations = order.authorizations();
-        while let Some(authorization) = authorizations.next().await {
-            let mut authorization = authorization.context("read the authorization")?;
-            match authorization.status {
-                AuthorizationStatus::Valid => continue,
-                AuthorizationStatus::Pending => {}
-                status => bail!("authorization is {status:?}"),
-            }
-            let kind = if token.is_some() { ChallengeType::Dns01 } else { ChallengeType::Http01 };
-            let mut challenge = authorization.challenge(kind)
-                .context("Let's Encrypt offered no check for the selected validation method")?;
-            if let Some(token) = token {
-                // The order contains exactly one identifier. Remember the created record before
-                // waiting so it is removed even if DNS propagation or validation fails.
-                ensure!(dns_record.is_none(), "unexpected additional DNS authorization");
-                dns_record = Some(cloudflare::Challenge::create(&settings.address, challenge.key_authorization().dns_value(), token).await?);
-                dns_record.as_ref().unwrap().wait().await?;
-            } else {
-                answers.lock().unwrap().insert(challenge.token.clone(), challenge.key_authorization().as_str().to_string());
-            }
-            challenge.set_ready().await.context("start the check")?;
-        }
-        let status = order.poll_ready(&RetryPolicy::new().timeout(Duration::from_secs(120)))
-            .await.context("wait for the check")?;
-        if status != OrderStatus::Ready {
-            let detail = order.state().error.as_ref().and_then(|problem| problem.detail.clone()).unwrap_or_default();
-            bail!("Let's Encrypt did not confirm the address ({status:?}) {detail}");
-        }
-        Ok::<(), anyhow::Error>(())
-    }.await;
-    if let (Some(record), Some(token)) = (dns_record, token) {
-        if let Err(error) = record.remove(token).await {
-            // Never delete somebody else's TXT records or discard a valid authorization.
-            // A crash or unavailable API can leave a harmless stale TXT record.
-            eprintln!("DNS-01 cleanup: {error:#}");
-            if let Err(validation) = validation {
-                return Err(validation.context(format!("DNS-01 cleanup also failed: {error:#}")));
-            }
-        }
-    }
-    validation?;
+    let dns = Https::new()?;
+    validate_order(&mut order, settings, port, purpose, &dns).await?;
 
     let key = rcgen::KeyPair::generate().context("create the certificate key")?;
     let mut params = rcgen::CertificateParams::default();
@@ -449,6 +414,81 @@ pub async fn issue(state_dir: &Path, settings: &AcmeSettings, port: u16) -> Resu
         chain,
         key: PrivatePkcs8KeyDer::from(key_der),
     })
+}
+
+/// Complete authorization before finalizing any certificate. The injected
+/// HTTP client is the same verified HTTPS implementation used for ACME.
+async fn validate_order(
+    order: &mut Order,
+    settings: &AcmeSettings,
+    port: u16,
+    purpose: IssuePurpose,
+    dns: &dyn HttpClient,
+) -> Result<()> {
+    let ip = settings.address.parse::<IpAddr>().ok();
+    let answers: Answers = Arc::default();
+    let token = settings.cloudflare_token.as_deref();
+    let _server = if token.is_none() {
+        Some(ChallengeServer::start(answers.clone(), port, matches!(ip, Some(IpAddr::V6(_)))).await?)
+    } else { None };
+    let mut dns_record = None;
+    let mut probe_only = false;
+    let validation = async {
+        let mut authorizations = order.authorizations();
+        while let Some(authorization) = authorizations.next().await {
+            let mut authorization = authorization.context("read the authorization")?;
+            match authorization.status {
+                AuthorizationStatus::Valid => continue,
+                AuthorizationStatus::Pending => {}
+                status => bail!("authorization is {status:?}"),
+            }
+            let kind = if token.is_some() { ChallengeType::Dns01 } else { ChallengeType::Http01 };
+            let mut challenge = authorization.challenge(kind)
+                .context("Let's Encrypt offered no check for the selected validation method")?;
+            if let Some(token) = token {
+                // The order contains exactly one identifier. Remember the created record before
+                // waiting so it is removed even if DNS propagation or validation fails.
+                ensure!(dns_record.is_none(), "unexpected additional DNS authorization");
+                dns_record = Some(cloudflare::Challenge::create(dns, &settings.address, challenge.key_authorization().dns_value(), token).await?);
+                dns_record.as_ref().unwrap().wait(dns).await?;
+            } else {
+                answers.lock().unwrap().insert(challenge.token.clone(), challenge.key_authorization().as_str().to_string());
+            }
+            challenge.set_ready().await.context("start the check")?;
+        }
+        // Exactly one identifier is ordered. If no DNS challenge was needed,
+        // the CA reused a valid authorization (possibly from HTTP-01). An
+        // explicit configuration request must still prove zone access, DNS
+        // Edit and visibility before the candidate token can become active.
+        if purpose == IssuePurpose::Configure && dns_record.is_none() {
+            if let Some(token) = token {
+                probe_only = true;
+                dns_record = Some(cloudflare::Challenge::probe(dns, &settings.address, token).await?);
+                dns_record.as_ref().unwrap().wait(dns).await.context("verify Cloudflare renewal DNS propagation")?;
+            }
+        }
+        let status = order.poll_ready(&RetryPolicy::new().timeout(Duration::from_secs(120)))
+            .await.context("wait for the check")?;
+        if status != OrderStatus::Ready {
+            let detail = order.state().error.as_ref().and_then(|problem| problem.detail.clone()).unwrap_or_default();
+            bail!("Let's Encrypt did not confirm the address ({status:?}) {detail}");
+        }
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    if let (Some(record), Some(token)) = (dns_record, token) {
+        if let Err(error) = record.remove(dns, token).await {
+            // Never delete somebody else's TXT records or discard a valid authorization.
+            // A crash or unavailable API can leave a harmless stale TXT record.
+            eprintln!("DNS-01 cleanup: {error:#}");
+            if let Err(validation) = validation {
+                return Err(validation.context(format!("DNS-01 cleanup also failed: {error:#}")));
+            }
+            if probe_only {
+                return Err(error).context("verify Cloudflare renewal credentials: temporary probe cleanup failed");
+            }
+        }
+    }
+    validation
 }
 
 /// Serves the stored certificate if it is still valid, else keeps what `swap` has.
@@ -504,7 +544,7 @@ pub async fn keep_renewed(
                 }
                 Ok(true) => {}
             }
-            match issue(&state_dir, &settings, 80).await.and_then(|issued| {
+            match issue(&state_dir, &settings, 80, IssuePurpose::Renew).await.and_then(|issued| {
                 let next = issued.renew_at()?;
                 // Recheck under the same short-lived cross-process lock used by
                 // activation admission and commit. A newly queued activation

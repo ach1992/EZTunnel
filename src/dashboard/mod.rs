@@ -512,7 +512,7 @@ pub async fn certificate(state_dir: &Path, lets_encrypt: bool, staging: bool, ad
         } else {
             println!("It checks this server over port 80, which must be free and open for about a minute.");
         }
-        let issued = acme::issue(state_dir, &wanted, 80).await?;
+        let issued = acme::issue(state_dir, &wanted, 80, acme::IssuePurpose::Configure).await?;
         let (_, until) = issued.validity()?;
         let kind = if staging { " (staging, not trusted by browsers)" } else { "" };
         println!("Certificate ready{kind}, valid until {}.", acme::utc_text(until));

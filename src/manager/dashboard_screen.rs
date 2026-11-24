@@ -215,8 +215,13 @@ Add your other servers on the dashboard's Servers page.",
                     ui::note("Let's Encrypt checks this server over port 80. It must be free during issuance and renewal.");
                 }
                 let current = s.url.trim_start_matches("https://").rsplit_once(':').map(|(host, _)| host.trim_matches(['[', ']']).to_string());
-                let address = ui::ask("Address for the certificate (IP or domain)", current.as_deref(), |text: &String| {
-                    if text.trim().is_empty() { Err("enter an address".to_string()) } else { Ok(()) }
+                let prompt = if method == 1 { "Domain for the certificate" } else { "Address for the certificate (IP or domain)" };
+                let address = ui::ask(prompt, current.as_deref(), |text: &String| {
+                    let address = dashboard::certificate_address(text).map_err(|error| error.to_string())?;
+                    if method == 1 && address.parse::<std::net::IpAddr>().is_ok() {
+                        return Err("DNS-01 requires a domain, not an IP address".to_string());
+                    }
+                    Ok(())
                 })?;
                 let mut args = vec!["dashboard", "certificate", "--lets-encrypt", "--address", address.trim()];
                 if method == 1 { args.push("--cloudflare-dns"); }
