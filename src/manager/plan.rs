@@ -456,11 +456,11 @@ impl Plan {
         self.game.is_some() && self.side == Side::Foreign && self.game_iran_ip().is_none()
     }
 
-    /// The listening end of a new tunnel takes IPv4 and IPv6 on one socket (`[::]`), so either
-    /// family can reach it: a route that drops one may carry the other. Raw carriers and TUN
-    /// keep their own addressing.
+    /// Use the dual-stack carrier listener when IPv6 is requested. The outer
+    /// socket family is independent of the inner TUN addresses. Raw carriers
+    /// keep their own addressing; preserve an explicitly selected listen IP.
     pub fn listen_on_both_families(&mut self) {
-        if !self.dials() && self.listen_ip == "0.0.0.0" && !is_raw(self.transport) && self.tun.is_none() {
+        if !self.dials() && self.listen_ip == "0.0.0.0" && !is_raw(self.transport) {
             self.listen_ip = "::".into();
         }
     }

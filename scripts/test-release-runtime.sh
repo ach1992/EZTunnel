@@ -54,7 +54,9 @@ for image in ubuntu:22.04 debian:12 ubuntu:24.04 debian:13; do
             bash /fixture/install-latest.sh --version "v$FIXTURE_VERSION" --no-menu
             echo "$(cat /fixture/binary.sha256)  /usr/local/bin/eztunnel" | sha256sum -c -
             test "$(/usr/local/bin/eztunnel --version)" = "eztunnel $FIXTURE_VERSION"
-            /usr/local/bin/eztunnel agent --help | grep -q join
-            /usr/local/bin/eztunnel dashboard --help | grep -q serve
+            agent_help=$(/usr/local/bin/eztunnel agent --help)
+            printf "%s\n" "$agent_help" | grep -q join
+            dashboard_help=$(/usr/local/bin/eztunnel dashboard --help)
+            printf "%s\n" "$dashboard_help" | grep -q serve
         '
 done

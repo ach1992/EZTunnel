@@ -54,14 +54,16 @@ if [[ $prefix != /usr/local ]]; then
 else
     printf 'install %s\n' "$version" >> "$MOCK_TRACE"
     [[ $version == v0.13.0-ach.99 ]] || { echo 'Must install the checked version' >&2; exit 9; }
-    if [[ $MOCK_CASE == install-fail ]]; then
-        echo 'simulated system installation failure' >&2
-        exit 1
-    fi
 fi
 mkdir -p "$prefix/bin"
 cp "$MOCK_DIR/program" "$prefix/bin/eztunnel"
 chmod 755 "$prefix/bin/eztunnel"
+# The real installer can fail when restarting a management service AFTER
+# replacing the executable. Leave a usable agent in this partial-install case.
+if [[ $prefix == /usr/local && $MOCK_CASE == install-fail ]]; then
+    echo 'simulated management-service restart failure after installation' >&2
+    exit 1
+fi
 MOCK
 cat > "$work/program" <<'MOCK'
 #!/usr/bin/env bash
@@ -92,6 +94,26 @@ echo 'agent command unavailable on legacy program' >&2
 exit 1
 MOCK
 chmod 755 "$work/bin/curl" "$work/program" "$work/legacy"
+assert_trace() {
+    local expected=$1 actual
+    actual=$(cat "$MOCK_TRACE")
+    if [[ $actual != "$expected" ]]; then
+        printf 'Unexpected side effects in %s\nExpected trace:\n%s\nActual trace:\n%s\n' "$MOCK_CASE" "$expected" "$actual" >&2
+        exit 1
+    fi
+}
+# Prove the assertion itself fails closed even when its exit status is
+# being tested by an if statement (where Bash suppresses errexit).
+for forbidden in 'install v0.13.0-ach.99' 'join'; do
+    export MOCK_CASE=trace-assertion
+    printf 'download\nstage latest\n%s\n' "$forbidden" > "$MOCK_TRACE"
+    if (assert_trace $'download\nstage latest') >"$work/assertion.out" 2>&1; then
+        echo "Trace assertion accepted prohibited side effect: $forbidden" >&2
+        exit 1
+    fi
+    grep -Fq 'Unexpected side effects' "$work/assertion.out"
+done
+echo 'PASS: negative trace assertions reject unexpected installation and enrollment'
 scenario() {
     export MOCK_CASE=$1
     local expected=$2
@@ -116,35 +138,42 @@ scenario() {
     echo "PASS: $MOCK_CASE"
 }
 scenario existing 0
-[[ $(cat "$MOCK_TRACE") == join ]]
+assert_trace join
 scenario download-fail 1
 grep -Fq 'curl: simulated download failure' "$work/download-fail.out"
 grep -Fq 'Could not download the EZTunnel installer' "$work/download-fail.out"
-[[ $(cat "$MOCK_TRACE") == download && ! -e /usr/local/bin/eztunnel ]]
+assert_trace download
+[[ ! -e /usr/local/bin/eztunnel ]]
 scenario stage-fail 1
 grep -Fq 'GLIBC_2.39 not found' "$work/stage-fail.out"
 grep -Fq 'Could not prepare a runnable EZTunnel release' "$work/stage-fail.out"
-! grep -q '^install ' "$MOCK_TRACE"
+assert_trace $'download\nstage latest'
 [[ ! -e /usr/local/bin/eztunnel ]]
 scenario legacy-stage-fail 1
 grep -Fq 'GLIBC_2.39 not found' "$work/legacy-stage-fail.out"
-! grep -q '^install ' "$MOCK_TRACE"
+assert_trace $'download\nstage latest'
 cmp "$work/legacy" /usr/local/bin/eztunnel
 scenario legacy-upgrade 0
 grep -Fq 'This server has eztunnel 0.12.0' "$work/legacy-upgrade.out"
-[[ $(cat "$MOCK_TRACE") == $'download\nstage latest\ninstall v0.13.0-ach.99\njoin' ]]
+assert_trace $'download\nstage latest\ninstall v0.13.0-ach.99\njoin'
 scenario no-agent 1
 grep -Fq 'agent command unavailable' "$work/no-agent.out"
 grep -Fq 'cannot join a dashboard' "$work/no-agent.out"
-! grep -q '^install ' "$MOCK_TRACE"
+assert_trace $'download\nstage latest'
 [[ ! -e /usr/local/bin/eztunnel ]]
 scenario install-fail 1
-grep -Fq 'simulated system installation failure' "$work/install-fail.out"
+grep -Fq 'simulated management-service restart failure after installation' "$work/install-fail.out"
 grep -Fq 'Join was not attempted' "$work/install-fail.out"
-! grep -q '^join$' "$MOCK_TRACE"
+assert_trace $'download\nstage latest\ninstall v0.13.0-ach.99'
+cmp "$work/program" /usr/local/bin/eztunnel
+[[ $(/usr/local/bin/eztunnel --version) == 'eztunnel 0.13.0-ach.99' ]]
+agent_help=$(/usr/local/bin/eztunnel agent --help)
+grep -Fq join <<<"$agent_help"
+# Help/version checks above must not consume the enrollment or add side effects.
+assert_trace $'download\nstage latest\ninstall v0.13.0-ach.99'
 scenario fresh 0
-[[ $(cat "$MOCK_TRACE") == $'download\nstage latest\ninstall v0.13.0-ach.99\njoin' ]]
+assert_trace $'download\nstage latest\ninstall v0.13.0-ach.99\njoin'
 scenario join-fail 3
 grep -Fq 'simulated join rejection' "$work/join-fail.out"
-[[ $(cat "$MOCK_TRACE") == $'download\nstage latest\ninstall v0.13.0-ach.99\njoin' ]]
+assert_trace $'download\nstage latest\ninstall v0.13.0-ach.99\njoin'
 echo 'PASS: join diagnostics, staging cleanup, existing agent path, pinned installation, and rejection propagation.'
