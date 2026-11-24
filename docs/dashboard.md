@@ -284,7 +284,35 @@ sudo eztunnel dashboard certificate --lets-encrypt --address 203.0.113.10
 Point the domain's DNS records to this server before requesting the certificate. Let's Encrypt
 checks over **port 80 HTTP-01**, so that port must be free and publicly reachable during issuance
 and renewal. The dashboard's existing HTTPS port must remain reachable, too. Renewal is automatic.
-For a CDN/proxy domain, ensure the HTTP-01 challenge reaches this host rather than a cached or
+
+If port 80 is already in use, select **DNS-01 (Cloudflare)** under **Settings → Dashboard access**.
+Enter the dashboard domain and a Cloudflare API token scoped to its DNS zone with **Zone Read**
+and **DNS Edit**. EZTunnel discovers the zone, creates only the required temporary
+`_acme-challenge` TXT record, waits for public DNS, and removes its record after validation.
+Issuance and automatic renewal use the same method; neither opens port 80 or changes the
+dashboard port, existing A/AAAA/CNAME records, or tunnels. DNS-01 needs a domain (not an IP).
+The token is stored in the dashboard's root-only state along with its certificate configuration
+for renewal and is never returned to the browser. Leave the token field blank to reuse it for
+the same configured domain, or enter a new token to replace it. If Let's Encrypt reuses a valid
+authorization, an explicit certificate request still checks the supplied renewal credential by
+creating, verifying and deleting a unique temporary TXT at the challenge name. A failed check
+leaves the previous certificate and renewal settings unchanged. Scheduled renewals with an
+already-valid authorization need no extra TXT probe. Keep dashboard state private.
+An interrupted request or failed DNS cleanup may leave a temporary TXT record; inspect the
+named record/ID in the dashboard service log before removing it. Other TXT records are not touched.
+DNS delegation must permit writing the challenge TXT record in the Cloudflare zone.
+
+From the terminal manager choose the DNS-01 validation method, or run:
+
+```sh
+sudo eztunnel dashboard certificate --lets-encrypt --cloudflare-dns --address panel.example.com
+```
+
+The CLI prompts for the token without echoing it or putting it in process arguments. If the
+current self-signed certificate has not been independently verified, prefer this CLI over a browser
+connection whose identity you cannot yet trust.
+
+For an HTTP-01 CDN/proxy domain, ensure the HTTP-01 challenge reaches this host rather than a cached or
 intercepted route. The **Use self-signed** button (or CLI `--self-signed`) restores the old mode and
 restarts the dashboard through the same verified activation workflow; browsers can show a certificate
 warning in that mode.

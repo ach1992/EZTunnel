@@ -827,7 +827,7 @@ mod tests {
     fn fixture(path: &Path) -> (acme::AcmeSettings, acme::Issued) {
         let wanted = acme::AcmeSettings {
             address: "first.example.test".into(),
-            staging: false,
+            staging: false, cloudflare_token: None,
         };
         let initial = issued(&wanted.address);
         super::super::save_settings(
@@ -851,7 +851,7 @@ mod tests {
     fn requested_for(address: &str) -> Selection {
         let wanted = acme::AcmeSettings {
             address: address.into(),
-            staging: false,
+            staging: false, cloudflare_token: None,
         };
         let issued = issued(&wanted.address);
         Selection {
@@ -1237,7 +1237,7 @@ mod tests {
         let previous = Selection {
             acme: Some(acme::AcmeSettings {
                 address: "expired.example.test".into(),
-                staging: false,
+                staging: false, cloudflare_token: None,
             }),
             certificate: None,
         };

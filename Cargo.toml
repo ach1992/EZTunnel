@@ -1,6 +1,6 @@
 [package]
 name = "eztunnel"
-version = "0.13.0-ach.1"
+version = "0.13.0-ach.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Independent encrypted reverse tunnel with locally pinned peer keys"

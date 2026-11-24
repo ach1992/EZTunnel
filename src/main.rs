@@ -378,6 +378,10 @@ enum DashboardCommand {
         /// Use Let's Encrypt's staging service (for testing; browsers do not trust it).
         #[arg(long)]
         staging: bool,
+        /// Validate the domain via Cloudflare DNS-01 instead of HTTP-01.
+        /// The API token is prompted privately (never put it in command-line arguments).
+        #[arg(long, requires_all = ["lets_encrypt", "address"])]
+        cloudflare_dns: bool,
         #[arg(long, default_value = eztunnel::dashboard::DEFAULT_STATE_DIR)]
         state_dir: PathBuf,
     },
@@ -837,8 +841,11 @@ async fn run(cli: Cli) -> Result<()> {
                 DashboardCommand::Port { port, state_dir } => eztunnel::dashboard::set_port(&state_dir, port)?,
                 DashboardCommand::Remove { delete_data, state_dir } => eztunnel::dashboard::remove(&state_dir, delete_data)?,
                 DashboardCommand::Serve { state_dir, listen } => eztunnel::dashboard::serve(&state_dir, listen).await?,
-                DashboardCommand::Certificate { lets_encrypt, self_signed: _, address, staging, state_dir } => {
-                    eztunnel::dashboard::certificate(&state_dir, lets_encrypt, staging, address).await?
+                DashboardCommand::Certificate { lets_encrypt, self_signed: _, address, staging, cloudflare_dns, state_dir } => {
+                    let token = if cloudflare_dns {
+                        Some(dialoguer::Password::new().with_prompt("Cloudflare API token (Zone Read, DNS Edit)").interact()?)
+                    } else { None };
+                    eztunnel::dashboard::certificate(&state_dir, lets_encrypt, staging, address, token).await?
                 }
                 DashboardCommand::RecoverCertificate { state_dir } => eztunnel::dashboard::recover_certificate(&state_dir).await?,
                 DashboardCommand::CertificateActivationWorker { state_dir } => eztunnel::dashboard::activate_certificate_worker(&state_dir).await?,

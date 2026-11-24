@@ -1407,7 +1407,7 @@ async fn settings_get(State(state): State<Arc<AppState>>, headers: HeaderMap) ->
     Json(json!({
         "prefs": super::prefs::shown(&prefs),
         "telegram_last": super::alerts::last_delivery(&state.state_dir),
-        "panel": {"address": state.public.0, "port": state.public.1, "https": state.secure, "cert": cert, "certificate_address": configured_certificate.map(|s| s.address), "version": env!("CARGO_PKG_VERSION"), "state_dir": state.state_dir.display().to_string()},
+        "panel": {"address": state.public.0, "port": state.public.1, "https": state.secure, "cert": cert, "certificate_method": configured_certificate.as_ref().map(|s| if s.cloudflare_token.is_some() { "cloudflare_dns" } else { "http" }), "certificate_address": configured_certificate.map(|s| s.address), "version": env!("CARGO_PKG_VERSION"), "state_dir": state.state_dir.display().to_string()},
     }))
     .into_response()
 }
@@ -1467,17 +1467,39 @@ async fn certificate_set(State(state): State<Arc<AppState>>, request: Request) -
         Ok(form) => form,
         Err(response) => return response,
     };
-    let (letsencrypt, address) = match form["mode"].as_str() {
+    let (letsencrypt, address, cloudflare_token) = match form["mode"].as_str() {
         Some("lets_encrypt") => {
             let Some(domain) = form["address"].as_str() else {
                 return failed_with(StatusCode::BAD_REQUEST, "enter a domain name or IP address");
             };
-            match super::certificate_address(domain) {
-                Ok(value) => (true, Some(value)),
+            let address = match super::certificate_address(domain) {
+                Ok(value) => value,
                 Err(error) => return failed_with(StatusCode::BAD_REQUEST, format!("{error:#}")),
+            };
+            let token = match form["method"].as_str().unwrap_or("http") {
+                "http" => None,
+                "cloudflare_dns" => {
+                    let supplied = form["cloudflare_token"].as_str().unwrap_or("").trim();
+                    let token = if supplied.is_empty() {
+                        // Reuse credentials only for the same configured domain; never leak them
+                        // through the Settings API or reuse a zone's token for another address.
+                        super::load_settings(&state.state_dir).ok().and_then(|s| s.acme)
+                            .filter(|s| s.address == address).and_then(|s| s.cloudflare_token)
+                    } else { Some(supplied.to_owned()) };
+                    let Some(token) = token else {
+                        return failed_with(StatusCode::BAD_REQUEST, "enter a Cloudflare API token with Zone Read and DNS Edit");
+                    };
+                    Some(token)
+                }
+                _ => return failed_with(StatusCode::BAD_REQUEST, "unknown certificate validation method"),
+            };
+            let wanted = super::acme::AcmeSettings { address: address.clone(), staging: false, cloudflare_token: token.clone() };
+            if let Err(error) = wanted.validate() {
+                return failed_with(StatusCode::BAD_REQUEST, format!("{error:#}"));
             }
+            (true, Some(address), token)
         }
-        Some("self_signed") => (false, None),
+        Some("self_signed") => (false, None, None),
         _ => return failed_with(StatusCode::BAD_REQUEST, "mode must be lets_encrypt or self_signed"),
     };
     {
@@ -1492,7 +1514,7 @@ async fn certificate_set(State(state): State<Arc<AppState>>, request: Request) -
         // ACME issuance may run in this process, but activation/restart and rollback
         // run in a separately supervised systemd transient unit. The next server
         // instance reads durable progress rather than trusting this in-memory task.
-        let result = super::certificate(&state.state_dir, letsencrypt, false, address).await;
+        let result = super::certificate(&state.state_dir, letsencrypt, false, address, cloudflare_token).await;
         let mut task = state.certificate_task.lock().unwrap();
         task.running = false;
         if let Err(error) = result {
@@ -3007,7 +3029,7 @@ mod tests {
             chain: vec![rustls::pki_types::CertificateDer::from(cert.der().as_ref().to_vec())],
             key: rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
         };
-        let wanted = super::super::acme::AcmeSettings { address: "panel.example.com".into(), staging: false };
+        let wanted = super::super::acme::AcmeSettings { address: "panel.example.com".into(), staging: false, cloudflare_token: None };
         super::super::change_certificate_settings(dir.path(), Some((wanted, &issued))).unwrap();
         let pending = json_of(call(&app, status(&cookie)).await).await;
         assert_eq!(pending["configured_address"], "panel.example.com");
@@ -3017,6 +3039,58 @@ mod tests {
         assert!(super::super::acme::install_stored(dir.path(), &swap).is_some());
         let active = json_of(call(&app, status(&cookie)).await).await;
         assert_eq!((active["active"].as_bool(), active["restart_required"].as_bool()), (Some(true), Some(false)));
+    }
+
+    /// A missing/invalid token or IP is rejected before any order or DNS write.
+    /// A stored token can be reused only for its configured domain and is never
+    /// returned by the authenticated settings endpoint.
+    #[tokio::test]
+    async fn cloudflare_dns_form_validates_credentials_without_exposing_them() {
+        let (initial, mut state) = app().await;
+        drop(initial);
+        let dir = tempfile::tempdir().unwrap();
+        let token = "test-cloudflare-secret";
+        let mut settings = super::super::Settings {
+            version: 1, port: 33001, password_hash: "unused".into(), created: 1,
+            acme: Some(super::super::acme::AcmeSettings {
+                address: "panel.example.com".into(), staging: false,
+                cloudflare_token: Some(token.into()),
+            }),
+            acme_certificate: None,
+        };
+        super::super::save_settings(dir.path(), &settings).unwrap();
+        let configure = Arc::get_mut(&mut state).unwrap();
+        configure.state_dir = dir.path().to_path_buf();
+        configure.demo = false;
+        configure.certificate_task.lock().unwrap().running = true;
+        let app = router(state);
+        let cookie = signed_in(&app).await;
+        let path = "/api/dashboard/certificate";
+        for (body, expected) in [
+            (r#"{"mode":"lets_encrypt","method":"cloudflare_dns","address":"other.example.com"}"#, StatusCode::BAD_REQUEST),
+            (r#"{"mode":"lets_encrypt","method":"cloudflare_dns","address":"192.0.2.1","cloudflare_token":"test-token"}"#, StatusCode::BAD_REQUEST),
+            (r#"{"mode":"lets_encrypt","method":"cloudflare_dns","address":"panel.example.com","cloudflare_token":"bad token"}"#, StatusCode::BAD_REQUEST),
+            (r#"{"mode":"lets_encrypt","method":"unknown","address":"panel.example.com"}"#, StatusCode::BAD_REQUEST),
+            (r#"{"mode":"lets_encrypt","method":"cloudflare_dns","address":"PANEL.EXAMPLE.COM."}"#, StatusCode::CONFLICT),
+            (r#"{"mode":"lets_encrypt","method":"cloudflare_dns","address":"other.example.com","cloudflare_token":"new-token"}"#, StatusCode::CONFLICT),
+            (r#"{"mode":"lets_encrypt","address":"192.0.2.1"}"#, StatusCode::CONFLICT),
+        ] {
+            let response = call(&app, with_cookie(post(path, body, true), &cookie)).await;
+            assert_eq!(response.status(), expected, "{body}");
+            let value = json_of(response).await;
+            assert!(!value.to_string().contains(token));
+        }
+        let get = |path: &str| with_cookie(hyper::Request::get(path).body(Body::empty()).unwrap(), &cookie);
+        let response = call(&app, get("/api/settings")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = json_of(response).await;
+        assert_eq!(value["panel"]["certificate_method"], "cloudflare_dns");
+        assert_eq!(value["panel"]["certificate_address"], "panel.example.com");
+        assert!(!value.to_string().contains(token));
+        settings.acme.as_mut().unwrap().cloudflare_token = None;
+        super::super::save_settings(dir.path(), &settings).unwrap();
+        let value = json_of(call(&app, get("/api/settings")).await).await;
+        assert_eq!(value["panel"]["certificate_method"], "http");
     }
 
     /// Domain controls are not public and the demo never mutates host TLS state.
