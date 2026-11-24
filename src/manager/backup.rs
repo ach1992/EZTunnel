@@ -114,7 +114,7 @@ pub fn import(store: &Store, tunnels: &[(String, Value)], replace: bool) -> Repo
             if store.exists(name) && !replace {
                 return Ok(false);
             }
-            store.save(name, config)?;
+            if store.exists(name) { store.save(name, config)?; } else { store.save_new(name, config)?; }
             Ok(true)
         })();
         match result {

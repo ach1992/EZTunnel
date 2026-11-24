@@ -1,12 +1,13 @@
 //! A new tunnel from the dashboard: both ends are built here from one form, with one fresh key, the
 //! same way the terminal manager builds a tunnel and its pairing code, with the same per-carrier
 //! options (TLS look and fragmentation, TCP congestion control, FEC pacer, speed mode, Parallax
-//! mode, parallel connections). Raw-socket, TUN and Mirage tunnels and CDN setups need
+//! mode, parallel connections). Raw-socket and Mirage tunnels and CDN setups need
 //! measurements or choices on the machine, so they stay in the terminal manager.
 use crate::{
     config::Transport,
-    manager::plan::{self, Carry, Direction, Plan, Protocol, Side, check_name, parse_ports},
+    manager::plan::{self, Carry, Direction, Plan, Protocol, Side, TunPlan, check_name, parse_ports},
     tunnel_key::TunnelKey,
+    manager::tun_resources::Inventory,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -24,6 +25,7 @@ pub fn options_of(transport: Transport) -> Value {
         "speed": crate::manager::speed::applies(transport, false),
         "parallax": transport == Transport::Parallax,
         "game": !plan::is_raw(transport),
+        "tun": !plan::is_raw(transport),
     })
 }
 
@@ -54,7 +56,54 @@ fn transport_of(word: &str) -> Result<Transport> {
 /// game UDP on the direct datagram path in copies) with `game_port`, `game_copies` and, for a
 /// direct tunnel, `iran_address` (how the foreign server reaches the Iran server).
 pub fn build(form: &Value) -> Result<Built> {
-    build_with_key(form, TunnelKey::generate()?.display())
+    build_with_key(form, TunnelKey::generate()?.display(), None)
+}
+
+
+/// Only the authenticated inventory of the selected two servers can supply these resources.
+struct TunAllocation {
+    iran: TunPlan,
+    foreign: TunPlan,
+}
+
+pub fn wants_tun(form: &Value) -> bool {
+    matches!(form["carry"].as_str(), Some("tun" | "tun_ports"))
+}
+
+pub fn build_tun(form: &Value, iran: &Inventory, foreign: &Inventory) -> Result<Built> {
+    ensure!(wants_tun(form), "choose a TUN carry mode");
+    ensure!(!form["carriers"].is_array(), "TUN requires one carrier, not failover");
+    let (first, second) = match form["tun_mode"].as_str().unwrap_or("auto4") {
+        "auto4" => iran.automatic_pair(foreign, false)?,
+        "auto6" => iran.automatic_pair(foreign, true)?,
+        "manual" => (
+            form["tun_iran"].as_str().context("enter the Iran tunnel IP")?.trim().parse().context("invalid Iran tunnel IP")?,
+            form["tun_foreign"].as_str().context("enter the foreign tunnel IP")?.trim().parse().context("invalid foreign tunnel IP")?,
+        ),
+        _ => bail!("unknown TUN address mode"),
+    };
+    iran.check_pair(first, second)?;
+    foreign.check_pair(first, second)?;
+    let mtu = match &form["tun_mtu"] {
+        Value::Null => crate::manager::iface::DEFAULT_TUN_MTU,
+        value => value.as_u64().and_then(|n| u16::try_from(n).ok()).context("invalid TUN MTU")?,
+    };
+    let forwarding_port = if form["carry"] == "tun_ports" {
+        let mut extra: Vec<u16> = parse_ports(form["ports"].as_str().unwrap_or(""))?
+            .iter().map(|rule| rule.listen).collect();
+        let transport = if form["transport"] == "ipv6" { &form["ipv6_transport"] } else { &form["transport"] };
+        let transport = transport_of(transport.as_str().unwrap_or(""))?;
+        extra.push(form["tunnel_port"].as_u64().and_then(|n| u16::try_from(n).ok())
+            .unwrap_or_else(|| plan::default_tunnel_port(transport)));
+        Some(iran.relay_port(foreign, &extra)?)
+    } else { None };
+    let tun = TunAllocation {
+        iran: TunPlan { name: iran.free_name()?, local_ip: first.to_string(), peer_ip: second.to_string(),
+            mtu, forwarding_port, fragment: false },
+        foreign: TunPlan { name: foreign.free_name()?, local_ip: second.to_string(), peer_ip: first.to_string(),
+            mtu, forwarding_port, fragment: false },
+    };
+    build_with_key(form, TunnelKey::generate()?.display(), Some(&tun))
 }
 
 /// Most carriers a failover tunnel may have.
@@ -73,6 +122,7 @@ const CARRIER_KEYS: [&str; 13] = [
 /// foreign end, under one key; the user ports and SOCKS5 belong to the tunnel and are served by
 /// whichever carrier is active (see `config::Failover`).
 pub fn build_failover(form: &Value) -> Result<Built> {
+    ensure!(!wants_tun(form), "TUN requires one carrier, not failover");
     let carriers = form["carriers"].as_array().context("choose the carriers of the failover tunnel")?;
     ensure!(
         (2..=FAILOVER_MOST).contains(&carriers.len()),
@@ -110,7 +160,7 @@ pub fn build_failover(form: &Value) -> Result<Built> {
         let mut one = base.clone();
         one["transport"] = json!(word);
         one["tunnel_port"] = json!(port);
-        let built = build_with_key(&one, key.clone()).with_context(|| format!("carrier {} ({word})", index + 1))?;
+        let built = build_with_key(&one, key.clone(), None).with_context(|| format!("carrier {} ({word})", index + 1))?;
         match &mut merged {
             None => merged = Some(built),
             Some(tunnel) => {
@@ -137,7 +187,7 @@ pub fn build_failover(form: &Value) -> Result<Built> {
 }
 
 /// `build` with a given key (failover builds every carrier under one key).
-fn build_with_key(form: &Value, key: String) -> Result<Built> {
+fn build_with_key(form: &Value, key: String, tun: Option<&TunAllocation>) -> Result<Built> {
     let text = |key: &str| form[key].as_str().unwrap_or("").trim().to_string();
     let name = text("name");
     check_name(&name)?;
@@ -175,8 +225,12 @@ fn build_with_key(form: &Value, key: String) -> Result<Built> {
     let carry = match text("carry").as_str() {
         "" | "ports" => Carry::Ports,
         "socks" => Carry::Socks,
+        "tun" => Carry::Tun,
+        "tun_ports" => Carry::TunPorts,
         other => bail!("{other} cannot be set up from the dashboard; use the terminal manager"),
     };
+    ensure!(carry.uses_tun() == tun.is_some(), "TUN needs both servers’ resource inventory");
+    ensure!(!carry.uses_tun() || !(game_entry || form["game"] == true), "Game mode is not available with TUN");
     let protocol = match text("protocol").as_str() {
         "" | "tcp" => Protocol::Tcp,
         "udp" => Protocol::Udp,
@@ -242,6 +296,7 @@ fn build_with_key(form: &Value, key: String) -> Result<Built> {
                 .context("parallel connections must be 1 to 16")? as usize,
         ),
     };
+    ensure!(!carry.uses_tun() || pool.is_none_or(|n| n == 1), "TUN requires one connection");
     let game = if game_entry || flag("game") {
         offered("game", "game")?;
         ensure!(
@@ -277,6 +332,10 @@ fn build_with_key(form: &Value, key: String) -> Result<Built> {
         let mut plan = Plan::new(key.clone(), side, direction, transport);
         plan.tunnel_port = tunnel_port;
         plan.carry = carry;
+        if let Some(tun) = tun {
+            plan.tun = Some(if side == Side::Iran { tun.iran.clone() } else { tun.foreign.clone() });
+            plan.pool = 1;
+        }
         plan.protocol = protocol;
         plan.parallax_mode = parallax_mode;
         plan.tls_profile = tls_profile;
@@ -299,17 +358,18 @@ fn build_with_key(form: &Value, key: String) -> Result<Built> {
         }
         plan.ipv6 = ipv6;
         match carry {
-            Carry::Ports => {
+            Carry::Ports | Carry::TunPorts => {
                 plan.ports = parse_ports(&text("ports"))?;
                 ensure!(!plan.ports.is_empty(), "give at least one port");
             }
-            _ => {
+            Carry::Socks => {
                 let bind = text("socks_bind");
                 if !bind.is_empty() {
                     ensure!(bind.parse::<std::net::SocketAddr>().is_ok(), "the SOCKS5 address must look like 127.0.0.1:1080");
                     plan.socks_bind = bind;
                 }
             }
+            Carry::Tun => {}
         }
         if side == Side::Foreign {
             plan.allowed = match (carry, text("reach").as_str()) {
@@ -329,9 +389,13 @@ fn build_with_key(form: &Value, key: String) -> Result<Built> {
 }
 
 /// Whether a configuration is one the dashboard may create (what `build` makes): an agent refuses
-/// anything else, so a hub can never install a raw-socket or TUN tunnel on it.
+/// anything else, so a hub can never install a raw-socket tunnel on it.
 pub fn creatable(config: &Value) -> Result<()> {
-    ensure!(config.get("tun").is_none_or(Value::is_null), "TUN tunnels are set up in the terminal manager");
+    if config["tun"].is_object() {
+        ensure!(config["socks5"].is_null(), "TUN + SOCKS5 is not a dashboard carry mode");
+        ensure!(config["tun"]["fragment"] != true && config["tun"]["parity"] != true
+            && config["tun"]["mtu_probe"] != true, "raw TUN options are set up in the terminal manager");
+    }
     let entries = config["listeners"]
         .as_array()
         .filter(|l| !l.is_empty())
@@ -358,6 +422,48 @@ mod tests {
     fn form(transport: &str, direction: &str) -> Value {
         json!({"name": "game", "transport": transport, "direction": direction, "address": "203.0.113.7",
                "carry": "ports", "ports": "9392, 2083=443", "protocol": "both", "reach": "local"})
+    }
+
+    #[test]
+    fn tun_modes_use_the_same_plan_on_all_dashboard_carriers() {
+        let empty = Inventory::default();
+        for transport in TRANSPORTS {
+            for direction in ["reverse", "direct"] {
+                for carry in ["tun", "tun_ports"] {
+                    let mut f = form(transport, direction);
+                    f["carry"] = json!(carry);
+                    let built = build_tun(&f, &empty, &empty)
+                        .unwrap_or_else(|error| panic!("{transport}/{direction}/{carry}: {error:#}"));
+                    assert_eq!(built.iran["tun"]["address"], built.foreign["tun"]["peer_address"]);
+                    assert_eq!(built.foreign["tun"]["address"], built.iran["tun"]["peer_address"]);
+                    assert_eq!(built.iran["tun"]["forwarding_port"], built.foreign["tun"]["forwarding_port"]);
+                    assert_eq!(built.iran["tun"]["forwarding_port"].is_number(), carry == "tun_ports");
+                    assert_eq!(built.iran["listeners"][0]["maps"].as_array().unwrap().len(), if carry == "tun_ports" {4} else {0});
+                    creatable(&built.iran).unwrap();
+                    creatable(&built.foreign).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tun_manual_ipv6_mtu_and_incompatible_options() {
+        let mut f = form("tcp", "direct");
+        f["carry"] = json!("tun_ports");
+        f["tun_mode"] = json!("manual");
+        f["tun_iran"] = json!("fd42::5");
+        f["tun_foreign"] = json!("fd42::6");
+        f["tun_mtu"] = json!(1300);
+        let empty = Inventory::default();
+        let built = build_tun(&f, &empty, &empty).unwrap();
+        assert_eq!(built.iran["tun"]["address"], "fd42::5");
+        assert_eq!(built.foreign["tun"]["mtu"], 1300);
+        for (key, value) in [("tun_mtu",json!(1279)), ("tun_foreign",json!("10.5.0.2")),
+            ("game",json!(true)), ("pool",json!(2)), ("carriers",json!([])), ("transport",json!("mirage"))] {
+            let mut invalid = f.clone();
+            invalid[key] = value;
+            assert!(build_tun(&invalid, &empty, &empty).is_err(), "{key}");
+        }
     }
 
     #[test]

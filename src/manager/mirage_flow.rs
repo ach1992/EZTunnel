@@ -68,7 +68,7 @@ fn import_setup(store:&Store)->Result<()> {
 pub(super) fn import_bundle(store:&Store,mut bundle:spoof_session::SetupBundle)->Result<Option<String>> {
     bundle.validate(spoof_session::now()?)?;
     if !super::mirage::consent()?{return Ok(None);}
-    if bundle.config["tun"].is_object(){bundle.config["tun"]["name"]=super::wizard::free_tun_name(store).into();}
+    if bundle.config["tun"].is_object(){bundle.config["tun"]["name"]=super::wizard::free_tun_name(store)?.into();}
     super::plan::check(&bundle.config)?;
     let server=bundle.config["mode"]=="server";let key=if server{"listeners"}else{"paths"};let entry=&bundle.config[key][0];
     let mut preview=vec![format!("Role: {}",if server{"Iran"}else{"Foreign"}),format!("Real peer: {}",entry["raw"]["peer_ip"]),

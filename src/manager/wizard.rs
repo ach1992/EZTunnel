@@ -534,9 +534,9 @@ fn finish_wizard(
                 Err(error) => return Err(error),
             }
             if let Some(tun) = &mut plan.tun {
-                tun.name = free_tun_name(store);
+                tun.name = free_tun_name(store)?;
                 if tun.forwarding_port.is_some() {
-                    tun.forwarding_port = Some(free_forwarding_port(store));
+                    tun.forwarding_port = Some(free_forwarding_port(store)?);
                 }
             }
         }
@@ -742,7 +742,7 @@ fn import_pairing(store: &Store) -> Result<Option<String>> {
             plan.protocol = protocols[ui::choose_required("Protocol", &labels, 0)?];
         }
         if let Some(tun) = &mut plan.tun
-            && let Some(warning)=localize_imported_tun(tun,free_tun_name(store),|port|service::port_busy(port,"tcp"))
+            && let Some(warning)=localize_imported_tun(tun,free_tun_name(store)?,|port|service::port_busy(port,"tcp"))
         {
             ui::warn(&warning);
         }
@@ -788,7 +788,7 @@ pub(super) fn from_mirage_result(store:&Store,report:&crate::spoof_session::Repo
         ip_mode:super::plan::IpMode::Normal,interface:None,local_ip:Some(local),mirage:Some(super::plan::MiragePlan{spoof_src_ip:outgoing,spoof_dst_ip:None,gateway_ip:None,peer_mac:None,advanced:Some(advanced)})});
     ui::note("Source/profile answers are filled from measured samples. The test key is NOT reused: a fresh tunnel key is generated. Configure the other endpoint from the final setup bundle; nothing starts before your confirmation.");
     if !carry(&mut plan)?{return Ok(());}
-    if let Some(tun)=&mut plan.tun{tun.name=free_tun_name(store);if tun.forwarding_port.is_some(){tun.forwarding_port=Some(free_forwarding_port(store));}}
+    if let Some(tun)=&mut plan.tun{tun.name=free_tun_name(store)?;if tun.forwarding_port.is_some(){tun.forwarding_port=Some(free_forwarding_port(store)?);}}
     if side==Side::Foreign&&matches!(plan.carry,Carry::Ports|Carry::TunPorts){
         ui::note("The Iran peer also needs the forwarding ports. Enter them here so its setup code is complete.");
         let text=ui::ask("Ports users will connect to on Iran",Some("443"),|text:&String|parse_ports(text).map(|_|()).map_err(|error|error.to_string()))?;
@@ -897,7 +897,8 @@ fn finish(
         }
         Ok(name)
     })?;
-    store.save(&name, &config)?;
+    let _lock = store.lock(&name, false)?;
+    store.save_new(&name, &config)?;
     ui::ok(&format!("Saved {}", store.path(&name).display()));
     if store.system {
         match service::install(store, &name) {
@@ -1285,42 +1286,14 @@ fn carry(plan: &mut Plan) -> Result<bool> {
     Ok(true)
 }
 
-/// The first `ezN` interface name that no saved tunnel uses yet.
-pub(super) fn free_tun_name(store: &Store) -> String {
-    let used: Vec<String> = store
-        .names()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|name| store.read(name).ok())
-        .filter_map(|config| config["tun"]["name"].as_str().map(str::to_string))
-        .collect();
-    first_free_tun_name(&used, |name| std::path::Path::new("/sys/class/net").join(name).exists())
+/// Shared allocation with the dashboard; terminal setup uses its local inventory.
+pub(super) fn free_tun_name(store: &Store) -> Result<String> {
+    super::tun_resources::Inventory::collect(store)?.free_name()
 }
 
-/// C31: the first `ezN` that neither a saved tunnel nor an existing interface uses.
-fn first_free_tun_name(used: &[String], exists: impl Fn(&str) -> bool) -> String {
-    (0..4096)
-        .map(|n| format!("ez{n}"))
-        .find(|name| !used.contains(name) && !exists(name))
-        .unwrap_or_else(|| "ez0".into())
-}
-
-/// The default `tun.forwarding_port`, or the first free one above it that no saved tunnel
-/// already uses: a second TUN + ports (or SOCKS) tunnel would otherwise collide with it silently,
-/// failing only at runtime.
-fn free_forwarding_port(store: &Store) -> u16 {
-    const DEFAULT: u16 = 47475;
-    let used: Vec<u16> = store
-        .names()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|name| store.read(name).ok())
-        .filter_map(|config| config["tun"]["forwarding_port"].as_u64())
-        .filter_map(|port| u16::try_from(port).ok())
-        .collect();
-    (DEFAULT..)
-        .find(|port| !used.contains(port))
-        .unwrap_or(DEFAULT)
+fn free_forwarding_port(store: &Store) -> Result<u16> {
+    super::tun_resources::Inventory::collect(store)?.relay_port(
+        &super::tun_resources::Inventory::default(), &[])
 }
 
 fn check_ip(text: &str) -> std::result::Result<(), String> {
@@ -1852,11 +1825,7 @@ mod tests {
     #[test]
     fn free_tun_name_skips_names_saved_tunnels_use(){
         let (_directory, store) = store_with(&[("a", tun_config(47475))]);
-        assert_ne!(free_tun_name(&store),"ez0");
-        // An interface that exists on the system (another program's, or a stale one) is skipped too.
-        let used=vec!["ez0".to_string()];
-        assert_eq!(first_free_tun_name(&used,|name|name=="ez1"||name=="ez2"),"ez3");
-        assert_eq!(first_free_tun_name(&[],|_|false),"ez0");
+        assert_ne!(free_tun_name(&store).unwrap(),"ez0");
     }
 
     fn store_with(tunnels: &[(&str, serde_json::Value)]) -> (tempfile::TempDir, Store) {
@@ -1882,14 +1851,14 @@ mod tests {
     fn free_forwarding_port_skips_every_port_a_saved_tunnel_already_uses() {
         let (_directory, store) = store_with(&[]);
         assert_eq!(
-            free_forwarding_port(&store),
+            free_forwarding_port(&store).unwrap(),
             47475,
             "the default when nothing is taken"
         );
         let (_directory, store) = store_with(&[("a", tun_config(47475))]);
-        assert_eq!(free_forwarding_port(&store), 47476);
+        assert_eq!(free_forwarding_port(&store).unwrap(), 47476);
         // Gaps are filled before counting further up.
         let (_directory, store) = store_with(&[("a", tun_config(47475)), ("b", tun_config(47477))]);
-        assert_eq!(free_forwarding_port(&store), 47476);
+        assert_eq!(free_forwarding_port(&store).unwrap(), 47476);
     }
 }

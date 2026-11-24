@@ -440,7 +440,7 @@ pub async fn serve(state_dir: &Path, listen: Option<IpAddr>) -> Result<()> {
         audit,
         live,
         ops: Arc::new(ops::LocalOps),
-        busy: Default::default(),
+        busy: Default::default(), tun_creates: Default::default(),
         followers: Arc::new(tokio::sync::Semaphore::new(http::MAX_FOLLOWERS)),
         fleet: Some(fleet::Fleet::open(state_dir)?),
         public: (
@@ -560,7 +560,7 @@ pub async fn demo(port: u16, empty: bool) -> Result<()> {
         audit: audit::Audit::disabled().with_samples(),
         live: data::Live::start(Box::new(data::DemoSource::with_ops(!empty, demo_ops.clone())), None),
         ops: Arc::new(demo_ops),
-        busy: Default::default(),
+        busy: Default::default(), tun_creates: Default::default(),
         followers: Arc::new(tokio::sync::Semaphore::new(http::MAX_FOLLOWERS)),
         fleet: None,
         public: ("203.0.113.10".into(), port),

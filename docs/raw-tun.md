@@ -1,6 +1,8 @@
 # Raw TUN datagrams
 
 
+For non-raw carriers, the [Dashboard TUN wizard](dashboard.md#private-ip-tunnels-tun) can configure both endpoints. This page describes the separate raw `tun` carrier.
+
 The `tun` carrier sends individual IP packets over a Linux packet socket. Its outer IPv4 profiles are TCP camouflage, UDP, ICMP, GRE, IP-in-IP, protocol 253 raw packets, and DNS-disguised UDP (see `raw-protocol.md`). proto58 mode uses IPv4 protocol 58 with a fixed 4-byte marker. Optional source/destination spoof addresses and next-hop MAC settings are local configuration. Interface discovery uses `iproute2` and ARP on the selected interface.
 
 This carrier preserves unreliable datagram delivery: losing one packet does not block later packets, and packet reordering is allowed. `fec-raw` and `fec-udp` provide a separate KCP/FEC transport for reliable streams.

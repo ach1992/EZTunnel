@@ -501,7 +501,7 @@ Iran server) with **Tools → Web dashboard**, then join your other servers to i
 over SSH. From there you can:
 
 - watch every tunnel on every server live, with 24 hours to 30 days of history;
-- create a tunnel on any two servers, edit, start, stop and delete tunnels, and read their logs;
+- create a tunnel on any two servers, including private TUN links with automatic or manual IPv4/IPv6 addresses and optional TCP/UDP forwarding; edit, start, stop and delete tunnels, and test their peer connectivity or read their logs;
 - run the transport checker (a preset or your own choices), the path finder and the Mirage source
   test between two servers, and create a tunnel from the best result;
 - check each server's health and fix what it finds, update EZTunnel on one server or all of them

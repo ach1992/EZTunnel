@@ -832,7 +832,7 @@ impl FleetClient {
     }
 
     pub async fn tool(&self, server: &str, tunnel: &str, tool: &str, form: Value) -> Result<Value> {
-        if !matches!(tool, "speedtest" | "pairing" | "quota_reset") {
+        if !matches!(tool, "speedtest" | "pairing" | "quota_reset" | "tun_probe") {
             return Err(invalid("unknown tunnel tool"));
         }
         if !form.is_object() {
@@ -2062,7 +2062,7 @@ mod tests {
             audit: audit::Audit::disabled(),
             live: data::Live::start(Box::new(data::DemoSource::new()), None),
             ops: Arc::new(ops::DemoOps::new(&[])),
-            busy: Default::default(), followers: Arc::new(tokio::sync::Semaphore::new(http::MAX_FOLLOWERS)),
+            busy: Default::default(), tun_creates: Default::default(), followers: Arc::new(tokio::sync::Semaphore::new(http::MAX_FOLLOWERS)),
             fleet: None, public: (ip.to_string(), port),
             agent_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             cert: None, certificate_task: Default::default(),
@@ -2515,7 +2515,7 @@ mod tests {
                 None,
             ),
             ops: Arc::new(demo),
-            busy: Default::default(),
+            busy: Default::default(), tun_creates: Default::default(),
             followers: Arc::new(tokio::sync::Semaphore::new(http::MAX_FOLLOWERS)),
             fleet: Some(qa_fleet.clone()),
             public: ("127.0.0.1".into(), port),

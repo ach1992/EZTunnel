@@ -128,6 +128,70 @@ started before the dialing end. Creation uses the Dashboard's existing busy lock
 service installation and key-guarded cleanup attempts if creation fails. The Dashboard and Fleet
 inventory share the resulting pair fingerprint.
 
+### Private IP tunnels (TUN)
+
+In **New tunnel → Type**, choose **IP tunnel (TUN)** for a private point-to-point
+network, or **TUN + port forwarding** to also forward the existing TCP/UDP maps.
+Select two online servers and any compatible single Dashboard carrier (including
+the IPv6-underlay option); Game mode and failover are not available in TUN mode.
+The inner IP version is independent of the outer transport.
+
+Both servers must have this TUN-capable Dashboard/Agent build, Linux systemd,
+`/dev/net/tun`, `iproute2`, and the privileges for TUN. Automatic IPv4 is the
+default. Automatic IPv6 selects ULA addresses; manual mode accepts two distinct
+unicast addresses of the same family without a prefix. MTU defaults to 1400
+(576–9000 for IPv4, 1280–9000 for IPv6). The interface names are selected separately
+on each server. With port forwarding, the same available inner TCP relay port is
+selected on both servers.
+
+The hub inventories both endpoints' interfaces, local addresses, non-default
+routes, TCP sockets and saved tunnel allocations (including stopped tunnels).
+The hub serializes TUN creates and each server rechecks resources under its own
+store-wide allocation lock before saving. Concurrent creates from another hub or
+terminal manager cannot overwrite a reservation; if a resource changed, creation
+fails with a diagnostic and the existing key-guarded pair cleanup removes only
+what this attempt created. External network changes can still make a previously
+saved configuration unusable; inspect its logs and free the conflict before restart.
+No default routes, NAT, forwarding sysctls or broad firewall policy are set up.
+
+For Fleet automation, use the ordinary create JSON form above, with
+`"carry": "tun"` or `"carry": "tun_ports"` and these optional fields:
+
+| Field | Value |
+|---|---|
+| `tun_mode` | `auto4` (default), `auto6`, or `manual` |
+| `tun_iran`, `tun_foreign` | The two inner IP literals, required for manual mode |
+| `tun_mtu` | Number in bytes, defaults to 1400 |
+
+Use `ports`, `protocol` and `reach` only for TUN + ports. The create response
+contains the actual assigned configurations in `tun.iran` and `tun.foreign`
+(without tunnel keys). **Tunnels** shows the private address, and the details
+page shows both configured IPs, the interface, MTU, the matching managed peer's
+interface when available, and whether each interface matches its configuration.
+Interface readiness does not mean that the authenticated carrier works or that
+the remote firewall permits IP traffic.
+
+**Test peer connectivity** sends up to three ICMP echo requests from the saved
+TUN interface to its configured peer; it tests both managed online endpoints
+when they can be matched unambiguously. On the CLI:
+
+```sh
+sudo eztunnel fleet tool site-link tun_probe --server local
+```
+
+The optional test requires `iputils-ping`. A missing reply is not proof of
+carrier failure (ICMP may be blocked). Stop, start, restart and delete use the
+ordinary tunnel lifecycle, including matched-pair actions and logs. A stopped
+tunnel retains its addresses and interface-name reservation until deleted.
+A failed second-side creation triggers the existing rollback; if an endpoint
+was disconnected and cleanup could not be confirmed, reconnect it and inspect the
+reported tunnel before retrying. Raw TUN carriers, Mirage, and specialist CDN
+setup remain terminal-manager operations.
+
+The forwarding reach/allowlist limits the inner TCP/UDP relay only. Linux routes
+and firewall policy govern ordinary IP packets carried by the TUN. See
+[Linux TUN](architecture.md#linux-tun) and [Security](security.md).
+
 For configuration changes, save **only** the fields to change (same as the browser's edit panel)
 in `/root/changes.json`:
 
@@ -216,13 +280,14 @@ local tunnels without the central Agent fleet.
 | 0.12.0 performance presets and automatic pool | Yes | Preview/apply inside Edit settings | `preset --preset NAME [--write]` | Server-specific values; apply on each end |
 | Start/stop/restart one or both matched ends | Yes | Yes | `start/stop/restart [--both]` | Both sides online and identified |
 | Delete both ends, with guarded target identity | Yes (manual pair selection) | Yes | `delete --both --confirm` | Pair guard requires updated Agent |
-| Server health, tunnel speed test / quota / pairing | Yes | Health; settings / operations | `health`, `tool` | Detailed diagnostic views remain Web-first |
+| Server health, tunnel speed test / quota / pairing / TUN peer test | Yes | Health; settings / operations | `health`, `tool` | Detailed diagnostic views remain Web-first |
 | Enroll / forget Agent | Yes | Code / forget | `join-code`, `remove-server` + `agent join` | SSH auto-install remains Web-only |
 | Rename server display name | Yes | Yes | `rename-server ID --name NAME` | Host identity and tunnels unchanged |
 | Restart every tunnel on a selected server | Yes | Yes | `restart-all` | Sequential; affects multiple services |
 | Backups, restores, binary updates, advanced checks, charts and alert configuration | Yes | Local manager / Web | Dashboard and existing local commands | Not exposed as new Fleet shortcuts |
 | Path Finder cancellation, connection-test filtering, Alerts history (0.12) | Yes | Web Dashboard | Web Dashboard | Browser workflows; not duplicated as terminal screens |
-| Local Raw/TUN, Mirage and specialist CDN setup | Local manager where available | Local manager | Existing local commands | The Dashboard wizard cannot create these centrally |
+| TUN and TUN + ports on Dashboard carriers | Yes | Local setup; Fleet create JSON | `create --form`, `tool tun_probe` | Both servers need TUN-capable builds |
+| Raw carriers (including raw TUN), Mirage and specialist CDN setup | Local manager where available | Local manager | Existing local commands | The Dashboard wizard cannot create these centrally |
 
 The matrix distinguishes **practical central parity** from engine support. An operation unavailable
 in the Dashboard/Agent architecture is not magically implemented by exposing a CLI entry point.

@@ -104,6 +104,11 @@ Addresses are plain IP literals **without a prefix**, use the same address famil
 
 `--check` parses configuration, loads the private key, and validates relevant TLS files. It does not bind sockets, verify peer reachability, configure TUN, resolve target DNS, or establish a tunnel. `RUST_LOG=debug` enables operational diagnostics.
 
+The [Dashboard TUN wizard](dashboard.md#private-ip-tunnels-tun) creates both non-raw endpoints
+from the same Plan and chooses collision-checked addresses, interface names and (for TUN + ports)
+one common relay port. The inner addresses are independent of the chosen carrier family.
+
+
 ## Changing settings
 
 Open the manager with `sudo eztunnel`, choose **Manage tunnels**, pick the tunnel, then:

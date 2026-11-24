@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.0-ach.4 (unreleased)
+
+- Create paired private IP tunnels (TUN and TUN + port forwarding) from Dashboard/Fleet with automatic or manual IPv4/IPv6 addresses, MTU and collision-checked interface names and relay ports.
+- Show configured endpoint IPs, live interface readiness and bounded peer connectivity checks; reuse existing pair lifecycle and rollback.
+
 ## 0.13.0-ach.3 (unreleased)
 
 - Use the full available dashboard width on large displays without changing the sidebar or responsive layout.

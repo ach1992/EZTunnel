@@ -117,6 +117,28 @@ impl Store {
     /// Checks a configuration the same way the service will, then replaces the tunnel's file.
     /// The previous version is kept as `NAME.json.bak`.
     pub fn save(&self, name: &str, config: &Value) -> Result<()> {
+        let _resources = self.resources_lock()?;
+        self.save_unlocked(name, config)
+    }
+
+    /// New tunnels reserve their TUN resources in the saved configuration, under one
+    /// host-wide lock shared by dashboard, terminal manager and imports. The caller holds
+    /// the per-tunnel change lock across service installation.
+    pub fn save_new(&self, name: &str, config: &Value) -> Result<()> {
+        check_name(name)?;
+        let _resources = self.resources_lock()?;
+        ensure!(!self.exists(name), "a tunnel named {name} already exists on this server");
+        let parsed = super::plan::check(config)?;
+        let inventory = if parsed.tun.is_some() {
+            super::tun_resources::Inventory::collect(self)?
+        } else {
+            super::tun_resources::Inventory::saved_relays(self)?
+        };
+        inventory.check_new(&parsed)?;
+        self.save_unlocked(name, config)
+    }
+
+    fn save_unlocked(&self, name: &str, config: &Value) -> Result<()> {
         check_name(name)?;
         create_private_dir(&self.dir())?;
         let mut text = serde_json::to_string_pretty(config)?;
@@ -180,6 +202,15 @@ impl Store {
         check_name(name)?;
         create_private_dir(&self.dir())?;
         let path = self.dir().join(format!(".{name}.lock"));
+        Self::lock_path(path, name, wait)
+    }
+
+    fn resources_lock(&self) -> Result<ChangeLock> {
+        create_private_dir(&self.root)?;
+        Self::lock_path(self.root.join(".tun-resources.lock"), "tunnel resource allocation", true)
+    }
+
+    fn lock_path(path: PathBuf, name: &str, wait: bool) -> Result<ChangeLock> {
         let mut options = fs::OpenOptions::new();
         options.create(true).truncate(false).write(true);
         #[cfg(unix)]

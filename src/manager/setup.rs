@@ -29,7 +29,7 @@ pub(super) fn save(store:&Store,name:&str,config:&serde_json::Value,action:SaveA
     let _lock=store.lock(name,false)?;
     super::plan::check(config)?;
     ensure!(!store.exists(name),"a tunnel with this name already exists");
-    store.save(name,config)?;
+    store.save_new(name,config)?;
     ui::ok(&format!("Saved {}",store.path(name).display()));
     if finish_start(action,||service::start_saved(store,name),||service::watch_started(||service::state(store,name)==service::State::Running,std::thread::sleep))?{
         ui::ok("Service is running. Waiting for the other endpoint until Live status confirms an authenticated link.");

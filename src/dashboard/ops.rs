@@ -106,6 +106,15 @@ pub trait Ops: Send + Sync {
         let _ = tunnel_key;
         self.delete(name)
     }
+    /// Fixed, key-free inventory used by the pair allocator; older agents must refuse it.
+    fn tun_inventory(&self) -> Result<crate::manager::tun_resources::Inventory> {
+        bail!("this server does not support dashboard TUN setup")
+    }
+    /// A bounded probe of the saved tunnel's own peer, never a caller-supplied address.
+    fn tun_probe(&self, name: &str, pair: Option<&str>) -> Result<serde_json::Value> {
+        let _ = (name, pair);
+        bail!("this server does not support TUN peer testing")
+    }
     /// Blocking: the running tunnel's own figures (its control socket's status answer).
     fn status(&self, name: &str) -> Result<serde_json::Value>;
     /// Blocking: a speed test through the tunnel, run from its Iran end.
@@ -190,6 +199,15 @@ pub fn answer(ops: &dyn Ops, request: &serde_json::Value) -> Result<serde_json::
                 .context("the expected pair fingerprint is missing or invalid")?;
             ops.delete_pair(name, pair)?;
             Ok(json!({"deleted": true}))
+        }
+        Some("tun_inventory") => Ok(serde_json::to_value(ops.tun_inventory()?)?),
+        Some("tun_probe") => {
+            let pair = match request.get("expect_pair") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => Some(value.as_str().filter(|p| valid_pair(p))
+                    .context("the expected pair fingerprint is invalid")?),
+            };
+            ops.tun_probe(name, pair)
         }
         Some("create") => Ok(serde_json::to_value(ops.create(name, &request["config"])?)?),
         Some("status") => ops.status(name),
@@ -403,11 +421,23 @@ impl LocalOps {
         Ok(())
     }
 
+    fn verify_tun_ready(config: &serde_json::Value) -> Result<()> {
+        if config["tun"].is_object() {
+            let tun = serde_json::from_value(config["tun"].clone())?;
+            anyhow::ensure!(crate::manager::tun_resources::interface_ready(&tun)?,
+                "service is running, but its TUN interface is not ready; see its log");
+        }
+        Ok(())
+    }
+
     /// Writes the service again with the current file and watches it come up.
     fn restart_saved(store: &Store, name: &str) -> (bool, Option<String>) {
         match service::install_with(store, name, &installed_program()) {
             Ok(()) => {
                 let up = service::watch_started(|| service::state(store, name) == State::Running, std::thread::sleep);
+                if up && let Err(problem) = store.read(name).and_then(|config| Self::verify_tun_ready(&config)) {
+                    return (false, Some(format!("{problem:#}")));
+                }
                 (up, (!up).then(|| "it did not stay up with these settings (see its log)".to_string()))
             }
             Err(error) => (false, Some(format!("{error:#}"))),
@@ -453,6 +483,7 @@ impl LocalOps {
                 std::thread::sleep,
             )
         });
+        if came_up == Some(true) { Self::verify_tun_ready(&store.read(name)?)?; }
         Ok(Outcome { changed: true, came_up })
     }
 }
@@ -558,18 +589,55 @@ impl Ops for LocalOps {
             Self::store()
         })()
         .map_err(|error| anyhow::anyhow!("{UNCHANGED}: {error:#}"))?;
+        if config["tun"].is_object() && !store.system {
+            bail!("{UNCHANGED}: dashboard TUN setup needs Linux systemd and root");
+        }
         // As context, so a busy lock keeps its code under the same words.
         let _lock = store.lock(name, false).context(UNCHANGED)?;
         if store.names()?.iter().any(|n| n == name) {
             bail!("{UNCHANGED}: a tunnel named {name} already exists on this server");
         }
-        store.save(name, config)?;
+        store.save_new(name, config).context(UNCHANGED)?;
         if !store.system {
             return Ok(Outcome { changed: true, came_up: None });
         }
         Self::install_new(&store, name, || service::install_with(&store, name, &installed_program()), || service::remove(name))?;
         let up = service::watch_started(|| service::state(&store, name) == State::Running, std::thread::sleep);
+        if up { Self::verify_tun_ready(config)?; }
         Ok(Outcome { changed: true, came_up: Some(up) })
+    }
+
+    fn tun_inventory(&self) -> Result<crate::manager::tun_resources::Inventory> {
+        let store = Self::store()?;
+        anyhow::ensure!(store.system, "dashboard TUN setup needs Linux systemd and root");
+        crate::manager::tun_resources::Inventory::collect(&store)
+    }
+
+    fn tun_probe(&self, name: &str, pair: Option<&str>) -> Result<serde_json::Value> {
+        let store = Self::store()?;
+        let _lock = store.lock(name, false)?;
+        Self::known(&store, name)?;
+        let saved = store.read(name)?;
+        if let Some(pair) = pair {
+            if let Some(failure) = pair_differs(&saved, name, pair) { return Err(failure); }
+        }
+        let config = crate::manager::plan::check(&saved)?;
+        let tun = config.tun.as_ref().context("this tunnel does not have a TUN interface")?;
+        let ready = service::state(&store, name) == State::Running
+            && crate::manager::tun_resources::interface_ready(tun)?;
+        let peer: std::net::IpAddr = tun.peer_address.parse()?;
+        if !ready {
+            return Ok(serde_json::json!({"interface_ready": false, "attempted": false,
+                "peer": peer, "reachable": false, "detail": "the configured TUN interface is not ready"}));
+        }
+        let result = std::process::Command::new("ping")
+            .args([if peer.is_ipv4() { "-4" } else { "-6" }, "-n", "-q", "-I", &tun.name,
+                "-c", "3", "-W", "1", "-w", "5", &peer.to_string()])
+            .output().context("run ping (iputils-ping is required for this test)")?;
+        let detail = format!("{} {}", String::from_utf8_lossy(&result.stdout).trim(),
+            String::from_utf8_lossy(&result.stderr).trim());
+        Ok(serde_json::json!({"interface_ready": true, "attempted": true, "peer": peer,
+            "reachable": result.status.success(), "detail": detail.trim()}))
     }
 
     fn server(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
@@ -790,6 +858,24 @@ impl Ops for DemoOps {
         self.names.iter().chain(added.iter())
             .filter(|n| !self.deleted(n) && seen.insert((*n).clone()))
             .cloned().collect()
+    }
+
+    fn tun_inventory(&self) -> Result<crate::manager::tun_resources::Inventory> {
+        let mut inventory = crate::manager::tun_resources::Inventory::default();
+        for (_, config) in self.created() { inventory.add_config(&config)?; }
+        Ok(inventory)
+    }
+
+    fn tun_probe(&self, name: &str, pair: Option<&str>) -> Result<serde_json::Value> {
+        let (_, config) = self.created().into_iter().find(|(n, _)| n == name)
+            .context("no saved demo tunnel")?;
+        if let Some(pair) = pair {
+            if let Some(failure) = pair_differs(&config, name, pair) { return Err(failure); }
+        }
+        let tun = config["tun"].as_object().context("this tunnel does not have a TUN interface")?;
+        let ready = self.running(name, true);
+        Ok(serde_json::json!({"demo": true, "interface_ready": ready, "attempted": ready,
+            "peer": tun["peer_address"], "reachable": ready, "detail": "simulated demo result"}))
     }
 
     fn create(&self, name: &str, config: &serde_json::Value) -> Result<Outcome> {
