@@ -438,9 +438,54 @@ mod tests {
                     assert_eq!(built.foreign["tun"]["address"], built.iran["tun"]["peer_address"]);
                     assert_eq!(built.iran["tun"]["forwarding_port"], built.foreign["tun"]["forwarding_port"]);
                     assert_eq!(built.iran["tun"]["forwarding_port"].is_number(), carry == "tun_ports");
+                    let (listener, dialer) = if direction == "reverse" {
+                        (&built.iran["listeners"][0], &built.foreign["paths"][0])
+                    } else {
+                        (&built.foreign["paths"][0], &built.iran["listeners"][0])
+                    };
+                    assert!(listener["addr"].as_str().unwrap().starts_with("0.0.0.0:"), "{transport}/{direction}/{carry}");
+                    assert!(dialer["addr"].as_str().unwrap().starts_with("203.0.113.7:"), "{transport}/{direction}/{carry}");
                     assert_eq!(built.iran["listeners"][0]["maps"].as_array().unwrap().len(), if carry == "tun_ports" {4} else {0});
                     creatable(&built.iran).unwrap();
                     creatable(&built.foreign).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tun_ipv6_underlay_is_independent_of_inner_address_family() {
+        let empty = Inventory::default();
+        for transport in TRANSPORTS {
+            for direction in ["reverse", "direct"] {
+                for carry in ["tun", "tun_ports"] {
+                    for mode in ["auto4", "auto6"] {
+                        for explicit in [false, true] {
+                            let mut f = form(transport, direction);
+                            f["carry"] = json!(carry);
+                            f["tun_mode"] = json!(mode);
+                            f["address"] = json!("2001:db8::7");
+                            f["tunnel_port"] = json!(7000);
+                            if explicit {
+                                f["transport"] = json!("ipv6");
+                                f["ipv6_transport"] = json!(transport);
+                            }
+                            let built = build_tun(&f, &empty, &empty)
+                                .unwrap_or_else(|error| panic!("{transport}/{direction}/{carry}/{mode}/{explicit}: {error:#}"));
+                            let (listener, dialer) = if direction == "reverse" {
+                                (&built.iran["listeners"][0], &built.foreign["paths"][0])
+                            } else {
+                                (&built.foreign["paths"][0], &built.iran["listeners"][0])
+                            };
+                            assert_eq!(listener["addr"], "[::]:7000", "{transport}/{direction}/{carry}/{mode}/{explicit}");
+                            assert_eq!(dialer["addr"], "[2001:db8::7]:7000");
+                            for end in [&built.iran, &built.foreign] {
+                                let inner: std::net::IpAddr = end["tun"]["address"].as_str().unwrap().parse().unwrap();
+                                assert_eq!(inner.is_ipv6(), mode == "auto6");
+                                creatable(end).unwrap();
+                            }
+                        }
+                    }
                 }
             }
         }

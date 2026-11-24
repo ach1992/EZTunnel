@@ -3,7 +3,7 @@
 ## Architecture Support
 
 The fork's official GitHub Releases are **native dynamically linked GNU/Linux
-builds** for x86-64 and ARM64 (Ubuntu 24.04 glibc 2.39 runtime baseline).
+builds** for x86-64 and ARM64 (Ubuntu 22.04 glibc 2.35 runtime baseline).
 Static musl builds are a separate **optional source-build** path, not what the
 one-line installer downloads. See [architectures.md](architectures.md).
 Both release architectures include browser-compatible TLS and the optional

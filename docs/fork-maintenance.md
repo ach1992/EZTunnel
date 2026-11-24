@@ -45,7 +45,7 @@ checks rather than the upstream release-signature requirement.
   **does not restart tunnel services**. If an active management service fails to restart,
   the installer prints its `systemctl` error, shows per-unit recovery commands and
   exits unsuccessfully, with the new executable and backup preserved.
-  Pin this fork release using `--version v0.13.0-ach.4`.
+  Pin this fork release using `--version v0.13.0-ach.5`.
 - **Local CLI / manager upgrade** (`sudo eztunnel upgrade` or **Update** in the
   terminal manager): downloads and verifies the fork release, validates saved
   configurations, replaces the binary transactionally, restarts previously running
