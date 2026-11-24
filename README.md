@@ -95,7 +95,7 @@ they are not static musl builds. See [Linux architectures](docs/architectures.md
 curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh
 less install-eztunnel.sh
 sudo bash install-eztunnel.sh                      # latest release
-sudo bash install-eztunnel.sh --version v0.13.0-ach.1  # pin this fork release
+sudo bash install-eztunnel.sh --version v0.13.0-ach.2  # pin this fork release
 sudo bash install-eztunnel.sh --no-menu            # install only, do not open the manager
 ```
 
