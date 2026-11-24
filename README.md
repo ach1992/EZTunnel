@@ -511,6 +511,8 @@ over SSH. From there you can:
 It runs as its own service over HTTPS with a random port and password, and tunnels never depend on
 it. See [the dashboard guide](docs/dashboard.md), including the current central Web/Menu/CLI
 feature-parity matrix, JSON automation examples, and partial-failure recovery rules.
+For a trusted certificate on a domain with port 80 already in use, choose **DNS-01 (Cloudflare)**
+in Dashboard Settings; see [certificate setup](docs/dashboard.md#certificate).
 
 ## Managing tunnels
 

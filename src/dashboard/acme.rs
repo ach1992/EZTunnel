@@ -3,8 +3,9 @@
 //! Encrypt issues for addresses); it is renewed after two thirds of its life and swapped into the
 //! running server, so nobody has to restart anything.
 //!
-//! Validation is HTTP-01: for the minute an order takes, a small server answers on port 80 with
-//! the challenge text and nothing else.
+//! Validation uses HTTP-01 (a temporary listener on port 80) or Cloudflare DNS-01
+//! (a temporary TXT record; no inbound HTTP listener).
+mod cloudflare;
 use super::tls::{self, Swap};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use bytes::Bytes;
@@ -36,16 +37,37 @@ const RETRY_FIRST: Duration = Duration::from_secs(5 * 60);
 const RETRY_MAX: Duration = Duration::from_secs(6 * 3600);
 
 /// What the dashboard's certificate should be, kept in its settings.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct AcmeSettings {
     /// The address the certificate names: an IP address or a domain.
     pub address: String,
     /// Use Let's Encrypt's staging service (certificates browsers do not trust; for testing).
     #[serde(default)]
     pub staging: bool,
+    /// Presence selects DNS-01. Stored only in the existing private dashboard state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloudflare_token: Option<String>,
+}
+
+impl std::fmt::Debug for AcmeSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcmeSettings").field("address", &self.address)
+            .field("staging", &self.staging).field("cloudflare_dns", &self.cloudflare_token.is_some()).finish()
+    }
 }
 
 impl AcmeSettings {
+    pub(super) fn validate(&self) -> Result<()> {
+        if let Some(token) = &self.cloudflare_token {
+            ensure!(self.address.parse::<IpAddr>().is_err(),
+                "Cloudflare DNS-01 requires a domain name, not an IP address");
+            ensure!(super::certificate_address(&self.address)? == self.address,
+                "the DNS-01 domain must be normalized");
+            cloudflare::validate_token(token)?;
+        }
+        Ok(())
+    }
+
     fn directory(&self) -> &'static str {
         if self.staging {
             LetsEncrypt::Staging.url()
@@ -87,8 +109,23 @@ pub fn renew_time(not_before: u64, not_after: u64) -> u64 {
 /// The whole dashboard settings file is atomically replaced, so no reader can see
 /// a new key paired with an old certificate or an old domain.
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
+struct CertificateIdentity {
+    address: String,
+    #[serde(default)]
+    staging: bool,
+}
+
+impl From<&AcmeSettings> for CertificateIdentity {
+    fn from(wanted: &AcmeSettings) -> Self {
+        Self { address: wanted.address.clone(), staging: wanted.staging }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct SavedCertificate {
-    wanted: AcmeSettings,
+    // The certificate's identity does not depend on DNS credentials. Keep the
+    // token only in the private active settings and any pending rollback record.
+    wanted: CertificateIdentity,
     chain: Vec<String>,
     key: String,
 }
@@ -97,14 +134,14 @@ impl SavedCertificate {
     pub fn from_issued(wanted: &AcmeSettings, issued: &Issued) -> Result<Self> {
         validate_for(issued, wanted)?;
         Ok(Self {
-            wanted: wanted.clone(),
+            wanted: CertificateIdentity::from(wanted),
             chain: issued.chain.iter().map(|cert| hex::encode(cert.as_ref())).collect(),
             key: hex::encode(issued.key.secret_pkcs8_der()),
         })
     }
 
     pub fn issued_for(&self, wanted: &AcmeSettings) -> Result<Issued> {
-        ensure!(&self.wanted == wanted, "certificate is for a different address or ACME environment");
+        ensure!(self.wanted == CertificateIdentity::from(wanted), "certificate is for a different address or ACME environment");
         let issued = Issued {
             chain: self.chain.iter().map(|cert| hex::decode(cert).map(CertificateDer::from)).collect::<std::result::Result<_, _>>()?,
             key: PrivatePkcs8KeyDer::from(hex::decode(&self.key)?),
@@ -326,6 +363,7 @@ fn challenge_answer(answers: &Answers, path: &str) -> Option<String> {
 /// Orders a certificate for `settings.address` without touching the active certificate.
 /// Persistence is a separate, atomic settings transaction after validation.
 pub async fn issue(state_dir: &Path, settings: &AcmeSettings, port: u16) -> Result<Issued> {
+    settings.validate()?;
     let ip = settings.address.parse::<IpAddr>().ok();
     let identifier = match ip {
         Some(ip) => Identifier::Ip(ip),
@@ -341,37 +379,53 @@ pub async fn issue(state_dir: &Path, settings: &AcmeSettings, port: u16) -> Resu
     let mut order = account.new_order(&new_order).await.context("order the certificate")?;
 
     let answers: Answers = Arc::default();
-    let _server = ChallengeServer::start(answers.clone(), port, matches!(ip, Some(IpAddr::V6(_)))).await?;
-    let mut authorizations = order.authorizations();
-    while let Some(authorization) = authorizations.next().await {
-        let mut authorization = authorization.context("read the authorization")?;
-        match authorization.status {
-            AuthorizationStatus::Valid => continue,
-            AuthorizationStatus::Pending => {}
-            status => bail!("authorization is {status:?}"),
+    let token = settings.cloudflare_token.as_deref();
+    let _server = if token.is_none() {
+        Some(ChallengeServer::start(answers.clone(), port, matches!(ip, Some(IpAddr::V6(_)))).await?)
+    } else { None };
+    let mut dns_record = None;
+    let validation = async {
+        let mut authorizations = order.authorizations();
+        while let Some(authorization) = authorizations.next().await {
+            let mut authorization = authorization.context("read the authorization")?;
+            match authorization.status {
+                AuthorizationStatus::Valid => continue,
+                AuthorizationStatus::Pending => {}
+                status => bail!("authorization is {status:?}"),
+            }
+            let kind = if token.is_some() { ChallengeType::Dns01 } else { ChallengeType::Http01 };
+            let mut challenge = authorization.challenge(kind)
+                .context("Let's Encrypt offered no check for the selected validation method")?;
+            if let Some(token) = token {
+                // The order contains exactly one identifier. Remember the created record before
+                // waiting so it is removed even if DNS propagation or validation fails.
+                ensure!(dns_record.is_none(), "unexpected additional DNS authorization");
+                dns_record = Some(cloudflare::Challenge::create(&settings.address, challenge.key_authorization().dns_value(), token).await?);
+                dns_record.as_ref().unwrap().wait().await?;
+            } else {
+                answers.lock().unwrap().insert(challenge.token.clone(), challenge.key_authorization().as_str().to_string());
+            }
+            challenge.set_ready().await.context("start the check")?;
         }
-        let mut challenge = authorization
-            .challenge(ChallengeType::Http01)
-            .context("Let's Encrypt offered no HTTP-01 check for this address")?;
-        answers
-            .lock()
-            .unwrap()
-            .insert(challenge.token.clone(), challenge.key_authorization().as_str().to_string());
-        challenge.set_ready().await.context("start the check")?;
+        let status = order.poll_ready(&RetryPolicy::new().timeout(Duration::from_secs(120)))
+            .await.context("wait for the check")?;
+        if status != OrderStatus::Ready {
+            let detail = order.state().error.as_ref().and_then(|problem| problem.detail.clone()).unwrap_or_default();
+            bail!("Let's Encrypt did not confirm the address ({status:?}) {detail}");
+        }
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    if let (Some(record), Some(token)) = (dns_record, token) {
+        if let Err(error) = record.remove(token).await {
+            // Never delete somebody else's TXT records or discard a valid authorization.
+            // A crash or unavailable API can leave a harmless stale TXT record.
+            eprintln!("DNS-01 cleanup: {error:#}");
+            if let Err(validation) = validation {
+                return Err(validation.context(format!("DNS-01 cleanup also failed: {error:#}")));
+            }
+        }
     }
-    let status = order
-        .poll_ready(&RetryPolicy::new().timeout(Duration::from_secs(120)))
-        .await
-        .context("wait for the check")?;
-    if status != OrderStatus::Ready {
-        let detail = order
-            .state()
-            .error
-            .as_ref()
-            .and_then(|problem| problem.detail.clone())
-            .unwrap_or_default();
-        bail!("Let's Encrypt did not confirm the address ({status:?}) {detail}");
-    }
+    validation?;
 
     let key = rcgen::KeyPair::generate().context("create the certificate key")?;
     let mut params = rcgen::CertificateParams::default();
@@ -545,6 +599,35 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dns_credentials_are_not_part_of_certificate_identity_or_debug_output() {
+        let http: AcmeSettings = serde_json::from_str(r#"{"address":"panel.example.com","staging":false}"#).unwrap();
+        assert!(http.cloudflare_token.is_none());
+        let mut dns = http.clone();
+        dns.cloudflare_token = Some("test-secret-token".into());
+        assert!(dns.validate().is_ok());
+        assert!(!format!("{dns:?}").contains("test-secret-token"));
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec![dns.address.clone()]).unwrap();
+        let issued = Issued {
+            chain: vec![CertificateDer::from(cert.der().as_ref().to_vec())],
+            key: PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+        };
+        let saved = SavedCertificate::from_issued(&dns, &issued).unwrap();
+        assert!(!serde_json::to_string(&saved).unwrap().contains("test-secret-token"));
+        assert!(saved.issued_for(&http).is_ok());
+        let mut changed = dns.clone();
+        changed.cloudflare_token = Some("rotated-token".into());
+        assert!(saved.issued_for(&changed).is_ok());
+        changed.staging = true;
+        assert!(saved.issued_for(&changed).is_err());
+        changed.staging = false;
+        changed.address = "other.example.com".into();
+        assert!(saved.issued_for(&changed).is_err());
+        dns.address = "192.0.2.1".into();
+        assert!(dns.validate().is_err());
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -631,7 +714,7 @@ mod tests {
             let day = (days - days_from_civil(year as i64, month as i64, 1) + 1) as u8;
             (year, month, day)
         };
-        let wanted = AcmeSettings { address: "localhost".into(), staging: false };
+        let wanted = AcmeSettings { address: "localhost".into(), staging: false, cloudflare_token: None };
         let issued_at = |from: i64, until: i64| {
             let (der, key) = certificate(date(from), date(until));
             Issued { chain: vec![CertificateDer::from(der)], key: PrivatePkcs8KeyDer::from(key.serialize_der()) }

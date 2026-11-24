@@ -16,6 +16,12 @@
   let sessions = $state([]);
   let form = $state({ days: "7", proxy: "", tg: { enabled: false, token: "", chats: "", lang: "en", level: "bad", resolved: true } });
   let domain = $state("");
+  let certMethod = $state("http");
+  let cloudflareToken = $state("");
+  const reuseCloudflareToken = $derived(info?.panel?.certificate_method === "cloudflare_dns" &&
+    domain.trim().replace(/\.$/, "").toLowerCase() === info.panel.certificate_address);
+  const certificateDisabled = $derived(!domain.trim() || saving === "certificate" || certTask?.running ||
+    (certMethod === "cloudflare_dns" && !cloudflareToken.trim() && !reuseCloudflareToken));
   let certTask = $state(null);
   let nextUrl = $state("");
   let metricsToken = $state("");
@@ -32,7 +38,10 @@
       }
       loadFailed = false;
       info = data;
-      if (!certTask?.running) domain = data.panel.certificate_address ?? "";
+      if (!certTask?.running) {
+        domain = data.panel.certificate_address ?? "";
+        certMethod = data.panel.certificate_method ?? "http";
+      }
       const p = data.prefs;
       form = {
         days: String(p.auto_backup_days), proxy: p.proxy ?? "",
@@ -163,8 +172,13 @@
     saving = "certificate";
     try {
       const address = domain.trim();
-      const { status, data } = await changeCertificate(mode === "lets_encrypt" ? { mode, address } : { mode });
+      const body = mode === "lets_encrypt" ? { mode, address, method: certMethod } : { mode };
+      if (mode === "lets_encrypt" && certMethod === "cloudflare_dns" && cloudflareToken.trim()) {
+        body.cloudflare_token = cloudflareToken.trim();
+      }
+      const { status, data } = await changeCertificate(body);
       if (status !== 202) return say(data?.detail ?? t("failedShort"), true);
+      cloudflareToken = "";
       certTask = { running: true, address, error: null };
       nextUrl = data.url;
       say(t("certStarted"));
@@ -239,12 +253,20 @@
         <div><dt>{t("stData")}</dt><dd class="ltr mono">{info.panel.state_dir}</dd></div>
       </dl>
       <p class="muted small m0 mt12">{t("stPanelNote")}</p>
-      <label class="flabel mt12" for="dash-domain">{t("certDomain")}</label>
-      <div class="row-flex">
-        <input id="dash-domain" class="input ltr grow" type="text" inputmode="url" autocomplete="off" spellcheck="false" bind:value={domain} placeholder="panel.example.com" aria-describedby="dash-domain-help" />
-        <button class="btn primary" onclick={() => applyCertificate("lets_encrypt")} disabled={!domain.trim() || saving === "certificate" || certTask?.running} aria-busy={saving === "certificate"}>{t("certApply")}</button>
-      </div>
-      <p id="dash-domain-help" class="muted small mt12">{t("certHelp")}</p>
+      <label class="flabel mt12" for="cert-method">{t("certMethod")}</label>
+      <select id="cert-method" class="input" bind:value={certMethod} disabled={saving === "certificate" || certTask?.running}>
+        <option value="http">{t("certHttp")}</option>
+        <option value="cloudflare_dns">{t("certDns")}</option>
+      </select>
+      <label class="flabel mt12" for="dash-domain">{certMethod === "cloudflare_dns" ? t("certDnsDomain") : t("certDomain")}</label>
+      <input id="dash-domain" class="input ltr" type="text" inputmode="url" autocomplete="off" spellcheck="false" bind:value={domain} placeholder="panel.example.com" aria-describedby="dash-domain-help" disabled={saving === "certificate" || certTask?.running} />
+      {#if certMethod === "cloudflare_dns"}
+        <label class="flabel mt12" for="cert-token">{t("certToken")}</label>
+        <input id="cert-token" class="input ltr" type="password" autocomplete="new-password" spellcheck="false" bind:value={cloudflareToken}
+          placeholder={reuseCloudflareToken ? t("certTokenSaved") : ""} disabled={saving === "certificate" || certTask?.running} />
+      {/if}
+      <p id="dash-domain-help" class="muted small mt12">{t(certMethod === "cloudflare_dns" ? "certDnsHelp" : "certHelp")}</p>
+      <button class="btn primary mt12" onclick={() => applyCertificate("lets_encrypt")} disabled={certificateDisabled} aria-busy={saving === "certificate"}>{t("certApply")}</button>
       {#if info.panel.certificate_address}
         <div class="row-flex mt12">
           <span class="small muted">{t("certActive")} <span class="ltr">{info.panel.certificate_address}</span></span>

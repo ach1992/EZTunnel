@@ -204,15 +204,23 @@ Add your other servers on the dashboard's Servers page.",
             }
             Step::Port => dashboard::set_port(state_dir(), ask_port()?)?,
             Step::LetsEncrypt => {
-                ui::note(
-                    "Let's Encrypt checks this server over port 80 for about a minute: it must be free and open.
-The certificate names an IP address or a domain that points to this server, and renews by itself.",
-                );
+                let methods = vec![
+                    "HTTP-01 (domain or IP; port 80 must be free)".to_string(),
+                    "DNS-01 / Cloudflare (domain; no port 80 required)".to_string(),
+                ];
+                let Some(method) = ui::choose("Certificate validation method", &methods, 0)? else { return Ok(()); };
+                if method == 1 {
+                    ui::note("Use a Cloudflare API token limited to the domain's zone: Zone Read and DNS Edit. The certificate renews automatically.");
+                } else {
+                    ui::note("Let's Encrypt checks this server over port 80. It must be free during issuance and renewal.");
+                }
                 let current = s.url.trim_start_matches("https://").rsplit_once(':').map(|(host, _)| host.trim_matches(['[', ']']).to_string());
                 let address = ui::ask("Address for the certificate (IP or domain)", current.as_deref(), |text: &String| {
                     if text.trim().is_empty() { Err("enter an address".to_string()) } else { Ok(()) }
                 })?;
-                run_self(&["dashboard", "certificate", "--lets-encrypt", "--address", address.trim()])?;
+                let mut args = vec!["dashboard", "certificate", "--lets-encrypt", "--address", address.trim()];
+                if method == 1 { args.push("--cloudflare-dns"); }
+                run_self(&args)?;
             }
             Step::SelfSigned => run_self(&["dashboard", "certificate", "--self-signed"])?,
             Step::Log => {

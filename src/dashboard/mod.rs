@@ -355,9 +355,10 @@ pub fn summary(state_dir: &Path) -> Summary {
         None => "self-signed".to_string(),
         Some(wanted) => {
             let staging = if wanted.staging { ", staging" } else { "" };
+            let method = if wanted.cloudflare_token.is_some() { "DNS-01 / Cloudflare" } else { "HTTP-01" };
             match acme::load_for(state_dir, wanted).and_then(|issued| issued.validity().ok()) {
-                Some((_, until)) => format!("Let's Encrypt for {}{staging}, valid until {}", wanted.address, acme::utc_text(until)),
-                None => format!("Let's Encrypt for {}{staging}, not issued yet", wanted.address),
+                Some((_, until)) => format!("Let's Encrypt ({method}) for {}{staging}, valid until {}", wanted.address, acme::utc_text(until)),
+                None => format!("Let's Encrypt ({method}) for {}{staging}, not issued yet", wanted.address),
             }
         }
     };
@@ -497,15 +498,20 @@ fn change_certificate_settings(state_dir: &Path, next: Option<(acme::AcmeSetting
 /// Issue and validate a new certificate before modifying any live Dashboard settings.
 /// A systemd-managed Dashboard uses a separately supervised activation worker so
 /// restarting it can never kill the only code able to restore its old certificate.
-pub async fn certificate(state_dir: &Path, lets_encrypt: bool, staging: bool, address: Option<String>) -> Result<()> {
+pub async fn certificate(state_dir: &Path, lets_encrypt: bool, staging: bool, address: Option<String>, cloudflare_token: Option<String>) -> Result<()> {
     require_root()?;
     load_settings(state_dir)?;
     let selected = if lets_encrypt {
         let address = certificate_address(&address.unwrap_or_else(shown_address))?;
         ensure!(address != "SERVER-IP", "this server's address was not found; give it with --address");
-        let wanted = acme::AcmeSettings { address: address.clone(), staging };
+        let wanted = acme::AcmeSettings { address: address.clone(), staging, cloudflare_token };
+        wanted.validate()?;
         println!("Asking Let's Encrypt for a certificate for {address}.");
-        println!("It checks this server over port 80, which must be free and open for about a minute.");
+        if wanted.cloudflare_token.is_some() {
+            println!("Validating DNS ownership using Cloudflare (no port 80 required).");
+        } else {
+            println!("It checks this server over port 80, which must be free and open for about a minute.");
+        }
         let issued = acme::issue(state_dir, &wanted, 80).await?;
         let (_, until) = issued.validity()?;
         let kind = if staging { " (staging, not trusted by browsers)" } else { "" };
@@ -617,8 +623,8 @@ mod tests {
     fn certificate_change_is_atomic_across_domain_key_and_chain_and_survives_restarts() {
         let dir = tempfile::tempdir().unwrap();
         test_settings(dir.path());
-        let a = acme::AcmeSettings { address: "a.example.org".into(), staging: false };
-        let b = acme::AcmeSettings { address: "b.example.org".into(), staging: false };
+        let a = acme::AcmeSettings { address: "a.example.org".into(), staging: false, cloudflare_token: None };
+        let b = acme::AcmeSettings { address: "b.example.org".into(), staging: false, cloudflare_token: None };
         let issued_a = test_issued(&a.address);
         let issued_b = test_issued(&b.address);
         change_certificate_settings(dir.path(), Some((a.clone(), &issued_a))).unwrap();
@@ -673,7 +679,7 @@ mod tests {
                 chain: vec![rustls::pki_types::CertificateDer::from(cert.der().as_ref().to_vec())],
                 key: rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()),
             };
-            let wanted = acme::AcmeSettings { address: address.into(), staging: false };
+            let wanted = acme::AcmeSettings { address: address.into(), staging: false, cloudflare_token: None };
             let saved = acme::SavedCertificate::from_issued(&wanted, &issued).unwrap();
             assert_eq!(saved.issued_for(&wanted).unwrap().chain[0].as_ref(), cert.der().as_ref());
         }
@@ -683,7 +689,7 @@ mod tests {
     fn legacy_certificate_must_match_the_saved_address_before_serving() {
         let dir = tempfile::tempdir().unwrap();
         test_settings(dir.path());
-        let a = acme::AcmeSettings { address: "a.example.org".into(), staging: false };
+        let a = acme::AcmeSettings { address: "a.example.org".into(), staging: false, cloudflare_token: None };
         let issued = test_issued(&a.address);
         // Previous-version pair can be loaded only when it matches the configured SAN.
         std::fs::write(dir.path().join("acme-key.der"), issued.key.secret_pkcs8_der()).unwrap();
@@ -697,7 +703,7 @@ mod tests {
         std::fs::write(dir.path().join("acme-chain.pem"), pem_text).unwrap();
         update_settings(dir.path(), |s| { s.acme = Some(a.clone()); Ok(()) }).unwrap();
         assert!(acme::load_for(dir.path(), &a).is_some());
-        let b = acme::AcmeSettings { address: "b.example.org".into(), staging: false };
+        let b = acme::AcmeSettings { address: "b.example.org".into(), staging: false, cloudflare_token: None };
         update_settings(dir.path(), |s| { s.acme = Some(b.clone()); Ok(()) }).unwrap();
         assert!(acme::load_for(dir.path(), &b).is_none());
     }
@@ -728,7 +734,7 @@ mod tests {
             port: 31_000,
             password_hash: "x".into(),
             created: 1,
-            acme: Some(acme::AcmeSettings { address: "203.0.113.10".into(), staging: true }),
+            acme: Some(acme::AcmeSettings { address: "203.0.113.10".into(), staging: true, cloudflare_token: None }),
             acme_certificate: None,
         };
         save_settings(dir.path(), &settings).unwrap();

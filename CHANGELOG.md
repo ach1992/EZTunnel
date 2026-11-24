@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.0-ach.2 (unreleased)
+
+- Add native Dashboard Let's Encrypt DNS-01 with Cloudflare, including automatic renewal on installations where port 80 is occupied, in Web settings, terminal manager and CLI. Existing HTTP-01 and self-signed modes remain available.
+
 ## 0.13.0-ach.1 (2026-11-22)
 
 - Synchronizes upstream EZTunnel 0.13.0 failover, Game datagram fixes, port handling and Dashboard status.
