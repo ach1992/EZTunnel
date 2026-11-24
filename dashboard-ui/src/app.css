@@ -129,7 +129,7 @@ label.btn.disabled{opacity:.45;pointer-events:none}
 .side-foot{margin-top:auto;display:flex;flex-direction:column;gap:4px;padding-top:12px;border-top:1px solid var(--line)}
 .side-foot .btn{justify-content:flex-start}
 
-.main{min-width:0;padding:24px 32px 24px;max-width:1520px;width:100%;min-height:100vh;min-height:100dvh;display:flex;flex-direction:column}
+.main{min-width:0;padding:24px 32px 24px;width:100%;min-height:100vh;min-height:100dvh;display:flex;flex-direction:column}
 .main>*{min-width:0}
 .page{margin-bottom:48px}
 /* The title rides along as a frosted bar, so language, theme and the menu stay in reach. */
