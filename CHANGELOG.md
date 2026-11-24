@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.0-ach.3 (unreleased)
+
+- Use the full available dashboard width on large displays without changing the sidebar or responsive layout.
+
 ## 0.13.0-ach.2 (2026-11-24)
 
 - Add native Dashboard Let's Encrypt DNS-01 with Cloudflare, including automatic renewal on installations where port 80 is occupied, in Web settings, terminal manager and CLI. Existing HTTP-01 and self-signed modes remain available.
