@@ -27,6 +27,7 @@
     name: "", iran: LOCAL, foreign: "", direction: "reverse", transport: "tcp", port: "", portTouched: false,
     address: "", addressTouched: false, carry: "ports", ports: "", protocol: "tcp", reach: "local", socks: "127.0.0.1:1080",
     parallax_mode: "stream", speed: "default", tls_profile: "classic", tls_fragment: false, tcp_congestion: "", fec_pacer: false, pool: "4",
+    tun_mode: "auto4", tun_iran: "", tun_foreign: "", tun_mtu: "1400",
     game: false, game_port: "", game_copies: "3", iran_address: "", ipv6_transport: "tcp",
     fromCheck: false,
     // "one": one transport; "failover": several carriers in order behind the same user ports.
@@ -97,6 +98,17 @@
 
   const isIp = (s) => /^\d{1,3}(\.\d{1,3}){3}$/.test(s) || /^\[?[0-9a-fA-F:.]*:[0-9a-fA-F:.]*\]?$/.test(s);
   // The IPv6 entry runs another transport over IPv6: that one decides the options and port.
+  const isTun = $derived(f.carry === "tun" || f.carry === "tun_ports");
+  const hasPorts = $derived(f.carry === "ports" || f.carry === "tun_ports");
+  function setCarry(carry) {
+    f.carry = carry;
+    if (carry === "tun" || carry === "tun_ports") {
+      f.mode = "one";
+      f.game = false;
+      if (f.transport === "game") f.transport = "fec-udp";
+      if (f.ipv6_transport === "game") f.ipv6_transport = "fec-udp";
+    }
+  }
   const isIpv6 = $derived(f.transport === "ipv6");
   const kind = $derived(isIpv6 ? f.ipv6_transport : f.transport);
   const ipv6Choices = $derived(transports.find((x) => x.name === "ipv6")?.transports ?? []);
@@ -117,7 +129,7 @@
   const gameUdp = $derived(f.carry === "socks" || f.protocol !== "tcp");
   /** Only the choices the chosen carrier has go to the server, so a changed carrier sends none of the old ones. */
   function carrierOptions() {
-    const out = { pool: Math.min(16, Math.max(1, +plain(String(f.pool)) || 4)) };
+    const out = { pool: isTun ? 1 : Math.min(16, Math.max(1, +plain(String(f.pool)) || 4)) };
     if (opts.parallax) out.parallax_mode = f.parallax_mode;
     if (speedOn && f.speed !== "default") out.speed = f.speed;
     if (opts.tls) {
@@ -126,7 +138,7 @@
     }
     if (opts.congestion && f.tcp_congestion) out.tcp_congestion = f.tcp_congestion;
     if (opts.pacer) out.fec_pacer = f.fec_pacer;
-    if (opts.game && (f.game || kind === "game")) {
+    if (!isTun && opts.game && (f.game || kind === "game")) {
       out.game = true;
       if (/^\d+$/.test(plain(String(f.game_port)))) out.game_port = +plain(String(f.game_port));
       out.game_copies = Math.min(4, Math.max(1, +plain(String(f.game_copies)) || 3));
@@ -229,7 +241,15 @@
       if (!/^\d+$/.test(port) || +port < 1 || +port > 65535) e.port = t("portRule");
     }
     if (!f.address.trim()) e.address = t("addressMissing");
-    if (f.carry === "ports" && !plain(f.ports)) e.ports = t("portsErr");
+    if (hasPorts && !plain(f.ports)) e.ports = t("portsErr");
+    if (isTun) {
+      const a = plain(f.tun_iran), b = plain(f.tun_foreign);
+      if (f.tun_mode === "manual" && (!isIp(a) || !isIp(b) || a === b || a.includes(":") !== b.includes(":")))
+        e.tun = t("tunAddressError");
+      const min = f.tun_mode === "auto6" || (f.tun_mode === "manual" && a.includes(":")) ? 1280 : 576;
+      const mtu = plain(String(f.tun_mtu));
+      if (mtu && (!/^\d+$/.test(mtu) || +mtu < min || +mtu > 9000)) e.mtu = t("rangeErr", min, 9000);
+    }
     return e;
   });
   const valid = $derived(Object.keys(errors).length === 0);
@@ -242,7 +262,13 @@
     problem = "";
     const shared = {
       name: f.name.trim(), iran: f.iran, foreign: f.foreign, direction: f.direction, address: f.address.trim(), carry: f.carry,
-      ports: plain(f.ports), protocol: f.protocol, reach: f.reach, socks_bind: f.socks.trim(),
+      ports: hasPorts ? plain(f.ports) : "", protocol: f.protocol, reach: f.reach, socks_bind: f.socks.trim(),
+      ...(isTun ? {
+        tun_mode: f.tun_mode,
+        tun_iran: f.tun_mode === "manual" ? plain(f.tun_iran) : undefined,
+        tun_foreign: f.tun_mode === "manual" ? plain(f.tun_foreign) : undefined,
+        tun_mtu: +plain(String(f.tun_mtu)) || 1400,
+      } : {}),
     };
     const body = isFailover
       ? { ...shared, carriers: f.carriers.map((c) => ({ transport: c.transport, tunnel_port: +plain(c.port) })), tunnel_port: +plain(f.carriers[0].port) }
@@ -258,7 +284,7 @@
         step = "form";
         return;
       }
-      made = body;
+      made = { ...body, tun: data.tun };
       waited = 0;
       step = "done";
       refreshFleet();
@@ -307,13 +333,21 @@
       <div class="new-ends">
         {#each [["iranEnd", made.iran], ["foreignEnd", made.foreign]] as [label, server]}
           {@const x = endOn(server)}
+          {@const tun = made.tun?.[label === "iranEnd" ? "iran" : "foreign"]}
           <div class="new-end">
             <b>{t(label)}</b>
             <span class="muted small">{placeOf(server)?.name ?? server}</span>
+            {#if tun}
+              <b class="ltr">{tun.address}</b>
+              <span class="small ltr">{tun.name} · MTU {num(tun.mtu)}</span>
+            {/if}
             <span class="small">{linked(x) ? t("linkUp") : waited >= 60 ? t("linkNotYet") : t("linkWaiting")}</span>
           </div>
         {/each}
       </div>
+      {#if made.tun}
+        <p class="muted small m0">{t("tunCreatedHelp")}</p>
+      {/if}
       {#if made.carriers}
         {@const listener = placeOf(made.direction === "reverse" ? made.iran : made.foreign)?.name ?? ""}
         <div class="note info" role="note"><Icon name="lock" /><span>{t("foOpenPorts", listener, made.carriers.map((c) => `${c.tunnel_port} ${transports.find((x) => x.name === c.transport)?.udp ? "UDP" : "TCP"}`).join(", "))}</span></div>
@@ -353,8 +387,9 @@
         <section class="ed-sec" aria-labelledby="nt-link-h">
           <header><span class="step-n">3</span><h3 id="nt-link-h">{t("linkH")}</h3></header>
           <div class="seg full mb12" role="group" aria-label={t("foModeL")}>
-            {#each [["one", "foOne"], ["failover", "foMode"]] as [v, k]}<button type="button" aria-pressed={f.mode === v} onclick={() => (f.mode = v)}>{t(k)}</button>{/each}
+            {#each [["one", "foOne"], ["failover", "foMode"]] as [v, k]}<button type="button" aria-pressed={f.mode === v} disabled={isTun && v === "failover"} title={isTun && v === "failover" ? t("tunSingleCarrier") : undefined} onclick={() => (f.mode = v)}>{t(k)}</button>{/each}
           </div>
+          {#if isTun}<p class="muted small m0 ehelp">{t("tunSingleCarrier")}</p>{/if}
           {#if isFailover}
             <p class="muted small m0 ehelp">{t("foHelp")}</p>
             <ol class="fo-list mt8">
@@ -393,12 +428,12 @@
             <div class="grow">
               <label class="flabel" for="nt-transport">{t("transport")}</label>
               <select id="nt-transport" class="input" bind:value={f.transport}>
-                {#each transports as x (x.name)}<option value={x.name}>{x.name === "ipv6" ? "IPv6" : transportLabel(x.name)}</option>{/each}
+                {#each transports as x (x.name)}<option value={x.name} disabled={isTun && (x.game || (!x.ipv6 && x.options?.tun === false))}>{x.name === "ipv6" ? "IPv6" : transportLabel(x.name)}</option>{/each}
               </select>
               {#if isIpv6}
                 <label class="flabel mt8" for="nt-v6t">{t("ntOverIpv6")}</label>
                 <select id="nt-v6t" class="input" bind:value={f.ipv6_transport}>
-                  {#each ipv6Choices as x (x)}<option value={x}>{transportLabel(x)}</option>{/each}
+                  {#each ipv6Choices as x (x)}<option value={x} disabled={isTun && (x === "game" || transports.find((option) => option.name === x)?.options?.tun === false)}>{transportLabel(x)}</option>{/each}
                 </select>
               {/if}
             </div>
@@ -464,17 +499,19 @@
                     </select>
                   </div>
                 {/if}
-                <div>
-                  <label class="flabel" for="nt-pool">{t("ntPool")}</label>
-                  <input id="nt-pool" class="input ltr" type="number" min="1" max="16" bind:value={f.pool} />
-                </div>
+                {#if !isTun}
+                  <div>
+                    <label class="flabel" for="nt-pool">{t("ntPool")}</label>
+                    <input id="nt-pool" class="input ltr" type="number" min="1" max="16" bind:value={f.pool} />
+                  </div>
+                {/if}
               </div>
               {#if opts.tls}
                 <label class="chk mt12"><input type="checkbox" bind:checked={f.tls_fragment} /><span>{t("ntTlsFrag")}</span></label>
                 {#if f.tls_fragment}<p class="small m0 ehelp warn-t">{t("ntTlsFragHelp")}</p>{/if}
               {/if}
               {#if opts.pacer}<label class="chk mt12"><input type="checkbox" bind:checked={f.fec_pacer} /><span>{t("ntPacer")}</span></label>{/if}
-              {#if opts.game}
+              {#if opts.game && !isTun}
                 <label class="chk mt12"><input type="checkbox" bind:checked={f.game} /><span>{t("ntGame")}</span></label>
                 <p class="muted small m0 ehelp">{t("ntGameHelp")}</p>
                 {#if f.game}
@@ -494,12 +531,14 @@
           <header><span class="step-n">4</span><h3 id="nt-carry-h">{t("carryH")}</h3></header>
           <div class="ed-grid">
             <div>
-              <span class="flabel" id="nt-carry-l">{t("carryWhat")}</span>
-              <div class="seg full" role="group" aria-labelledby="nt-carry-l">
-                {#each [["ports", "carryPorts"], ["socks", "carrySocks"]] as [v, k]}<button type="button" aria-pressed={f.carry === v} onclick={() => (f.carry = v)}>{t(k)}</button>{/each}
-              </div>
+              <label class="flabel" for="nt-carry">{t("carryWhat")}</label>
+              <select id="nt-carry" class="input" value={f.carry} onchange={(event) => setCarry(event.currentTarget.value)}>
+                {#each [["ports", "carryPorts"], ["socks", "carrySocks"], ["tun", "carryTun"], ["tun_ports", "carryTunPorts"]] as [v, k]}
+                  <option value={v}>{t(k)}</option>
+                {/each}
+              </select>
             </div>
-            {#if f.carry === "ports"}
+            {#if hasPorts}
               <div>
                 <span class="flabel" id="nt-proto-l">{t("protocol")}</span>
                 <div class="seg full" role="group" aria-labelledby="nt-proto-l">
@@ -508,7 +547,34 @@
               </div>
             {/if}
           </div>
-          {#if f.carry === "ports"}
+          {#if isTun}
+            <div class="mt12">
+              <label class="flabel" for="nt-tun-mode">{t("tunAddressMode")}</label>
+              <select id="nt-tun-mode" class="input" bind:value={f.tun_mode}>
+                <option value="auto4">{t("tunAuto4")}</option>
+                <option value="auto6">{t("tunAuto6")}</option>
+                <option value="manual">{t("tunManual")}</option>
+              </select>
+              <p class="muted small m0 ehelp">{t("tunAutoHelp")}</p>
+            </div>
+            {#if f.tun_mode === "manual"}
+              <div class="ed-grid mt12">
+                <div><label class="flabel" for="nt-tun-iran">{t("tunIranIp")}</label>
+                  <input id="nt-tun-iran" class="input ltr" bind:value={f.tun_iran} placeholder="10.77.0.1" autocomplete="off" spellcheck="false" aria-invalid={Boolean(show("tun"))} /></div>
+                <div><label class="flabel" for="nt-tun-foreign">{t("tunForeignIp")}</label>
+                  <input id="nt-tun-foreign" class="input ltr" bind:value={f.tun_foreign} placeholder="10.77.0.2" autocomplete="off" spellcheck="false" aria-invalid={Boolean(show("tun"))} /></div>
+              </div>
+              {#if show("tun")}<p class="small bad-t m0 ehelp" role="alert">{show("tun")}</p>{/if}
+            {/if}
+            <details class="mt12" open={Boolean(show("mtu"))}>
+              <summary>{t("advanced")}</summary>
+              <label class="flabel mt8" for="nt-tun-mtu">MTU</label>
+              <input id="nt-tun-mtu" class="input ltr" inputmode="numeric" bind:value={f.tun_mtu} placeholder="1400" aria-invalid={Boolean(show("mtu"))} />
+              <p class="small m0 ehelp {show('mtu') ? 'bad-t' : 'muted'}">{show("mtu") || t("tunMtuHelp")}</p>
+            </details>
+            <p class="muted small m0 ehelp">{t("tunRoutingHelp")}</p>
+          {/if}
+          {#if hasPorts}
             <div class="mt12">
               <label class="flabel" for="nt-ports">{t("portsLabel")}</label>
               <div class="dice-in">
@@ -524,7 +590,7 @@
                 {#each [["local", "reachLocal"], ["any", "reachAny"]] as [v, k]}<button type="button" aria-pressed={f.reach === v} onclick={() => (f.reach = v)}>{t(k)}</button>{/each}
               </div>
             </div>
-          {:else}
+          {:else if f.carry === "socks"}
             <div class="mt12">
               <label class="flabel" for="nt-socks">{t("socksBind")}</label>
               <div class="dice-in">

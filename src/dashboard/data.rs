@@ -56,6 +56,18 @@ pub struct Carry {
     pub exits: Vec<String>,
 }
 
+/// Saved point-to-point addresses and whether the live interface matches them.
+#[derive(Serialize, Clone, Debug)]
+pub struct TunView {
+    pub interface: String,
+    pub address: String,
+    pub peer_address: String,
+    pub mtu: u16,
+    pub forwarding_port: Option<u16>,
+    /// None: not observed (an old agent, demo, or a failed inventory read).
+    pub interface_ready: Option<bool>,
+}
+
 #[derive(Serialize, Clone, Debug, Default)]
 pub struct Quota {
     pub used: u64,
@@ -87,6 +99,7 @@ pub struct Tunnel {
     /// The connection between the servers, for example `listen :7000` or `→ 203.0.113.5:7000`.
     pub link: String,
     pub carry: Carry,
+    pub tun: Option<TunView>,
     /// running, starting, stopped, failed or none (saved without a service).
     pub state: &'static str,
     /// working, no_traffic, not_connected, unconfirmed, silent, quota, down or unknown.
@@ -347,6 +360,12 @@ impl LocalSource {
             .map(|(port, copies)| Game { copies, port, ..Game::default() });
         let state = service::state(&self.store, name);
         view.state = state_word(state);
+        if let Some(tun) = &mut view.tun {
+            tun.interface_ready = if matches!(state, State::Running | State::Starting) {
+                serde_json::from_value(config["tun"].clone()).ok()
+                    .and_then(|config| crate::manager::tun_resources::interface_ready(&config).ok())
+            } else { Some(false) };
+        }
         let memory = self.memory.entry(name.to_string()).or_default();
         if !matches!(state, State::Running | State::Starting) {
             *memory = Memory::default();
@@ -433,6 +452,9 @@ fn describe(view: &mut Tunnel, config: &Value) {
         view.link = summary.link;
     }
     view.carry = carry(config);
+    view.tun = serde_json::from_value::<crate::config::TunConfig>(config["tun"].clone()).ok()
+        .map(|tun| TunView { interface: tun.name, address: tun.address, peer_address: tun.peer_address,
+            mtu: tun.mtu, forwarding_port: tun.forwarding_port, interface_ready: None });
     view.pair = pair_of(config);
     view.failover = failover_of(config);
 }
@@ -742,8 +764,11 @@ impl Source for DemoSource {
         }
         // Tunnels created in the demo run quietly with small sample figures.
         for (name, config) in ops.as_ref().map(|ops| ops.created()).unwrap_or_default() {
-            let mut tunnel = Tunnel { name, state: "running", link_state: "working", ..Tunnel::default() };
+            let running = ops.as_ref().is_some_and(|ops| ops.running(&name, true));
+            let mut tunnel = Tunnel { name, state: if running { "running" } else { "stopped" },
+                link_state: if running { "working" } else { "down" }, ..Tunnel::default() };
             describe(&mut tunnel, &config);
+            if let Some(tun) = &mut tunnel.tun { tun.interface_ready = Some(running); }
             tunnel.down_bps = Some(40_000.0 * self.noise());
             tunnel.up_bps = Some(8_000.0 * self.noise());
             tunnel.down_total = Some(0);

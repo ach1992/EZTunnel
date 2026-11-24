@@ -829,8 +829,7 @@ fn apply_preset(store: &Store, name: &str, config: &Value) -> Result<()> {
 
 fn save_and_restart(store: &Store, name: &str, config: &Value) -> Result<()> {
     let _lock = store.lock(name, true)?;
-    let earlier = store.previous_bytes(name);
-    store.save(name, config)?;
+    let change = store.save_change(name, config)?;
     ui::ok("Saved");
     let mut outcome = None;
     if store.system {
@@ -839,17 +838,25 @@ fn save_and_restart(store: &Store, name: &str, config: &Value) -> Result<()> {
             || started_well(store, name),
             store.has_previous(name),
             |question| ui::confirm(question, true),
-            || store.take_back_save(name, earlier.as_deref()),
+            || change.rollback(),
         )?;
         report_recovery(&result);
         outcome = Some(result);
     }
+    drop(change);
     std::thread::sleep(std::time::Duration::from_millis(800));
     match outcome {
-        Some(Recovery::KeptNew { install_error: Some(error) }) => {
+        Some(result) => recovery_result(result),
+        None => Ok(()),
+    }
+}
+
+fn recovery_result(outcome: Recovery) -> Result<()> {
+    match outcome {
+        Recovery::KeptNew { install_error: Some(error) } => {
             anyhow::bail!("the new settings are saved but their service could not be installed: {error}")
         }
-        Some(Recovery::RestoreFailed(error)) => anyhow::bail!("going back to the previous settings failed: {error}"),
+        Recovery::RestoreFailed(error) => anyhow::bail!("going back to the previous settings failed: {error}"),
         _ => Ok(()),
     }
 }
@@ -1139,11 +1146,29 @@ fn edit_file(store: &Store, name: &str) -> Result<()> {
         }
         match super::store::check_file(&draft) {
             Ok(_) => {
-                store.adopt(name, &draft)?;
+                let restart = store.system && ui::confirm("Save and restart the tunnel?", true)?;
+                let change = match store.adopt(name, &draft) {
+                    Ok(change) => change,
+                    Err(error) => {
+                        ui::fail(&format!("Could not save the configuration: {error:#}"));
+                        if !ui::confirm("Edit again?", true)? {
+                            let _ = std::fs::remove_file(&draft);
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
                 ui::ok("Saved");
-                if store.system && ui::confirm("Restart the tunnel to use it?", true)? {
-                    service::install(store, name)?;
-                    ui::ok("Restarted");
+                if restart {
+                    let result = recover_after_save(
+                        || service::install(store, name),
+                        || started_well(store, name),
+                        store.has_previous(name),
+                        |question| ui::confirm(question, true),
+                        || change.rollback(),
+                    )?;
+                    report_recovery(&result);
+                    recovery_result(result)?;
                 }
                 return Ok(());
             }

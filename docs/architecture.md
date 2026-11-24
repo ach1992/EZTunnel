@@ -17,6 +17,11 @@ Clients maintain configured connection pools and reconnect with bounded backoff.
 
 Optional TUN mode creates a point-to-point interface with the configured local and peer IP addresses. IP packets travel through the authenticated carrier. It uses one server listener or one client path with pool size one. Optional `tun.forwarding_port` starts an additional authenticated TCP multiplexer between the inner TUN addresses, allowing port maps, SOCKS and target allowlists alongside ordinary IP traffic. The kernel transports this TCP connection through the existing packet pump. Without that explicit port, TUN mode forwards IP packets only. It requires `iproute2`, `/dev/net/tun`, and suitable privileges. Only the point-to-point interface is configured; choosing additional routes, forwarding, NAT, and firewall policy is the administrator's responsibility.
 
+The Dashboard uses the same manager Plan and service lifecycle, not a separate packet engine.
+Its fixed authenticated Fleet inventory contains resource claims (not tunnel keys), and the
+store-wide resource lock revalidates them before a new configuration reserves them. The
+per-tunnel probe is bound to the saved peer and interface.
+
 With `transport: "tun"`, each IP packet is an independent encrypted datagram on a raw packet socket. Its authenticated session uses explicit nonces and a sliding replay window, permitting packet loss and reordering. Other carriers carry length-delimited IP packets on reliable streams. [Raw TUN framing](raw-tun.md) describes handshakes, heartbeats and reconnection. [Raw IPv4 carriers](raw-protocol.md) describes the TCP/UDP/ICMP/GRE/IPIP layouts, TCP camouflage, spoofing and proto58 mode. These outer formats wrap this project's Noise payloads.
 
 ## Source layout

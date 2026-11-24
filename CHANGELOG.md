@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.0-ach.4 (unreleased)
+
+- Create paired private IP tunnels (TUN and TUN + port forwarding) from Dashboard/Fleet with automatic or manual IPv4/IPv6 addresses, MTU and collision-checked interface names and relay ports.
+- Show configured endpoint IPs, live interface readiness and bounded peer connectivity checks tied to the exact endpoint; ignore stale probe replies and preserve results across routine snapshots.
+- Validate resource-changing configuration replacements, imports and undo using the shared allocation lock, preserving prior claims during immediate restart/rollback and reserving stopped Game server control ports.
+
 ## 0.13.0-ach.3 (unreleased)
 
 - Use the full available dashboard width on large displays without changing the sidebar or responsive layout.

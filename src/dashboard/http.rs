@@ -61,6 +61,8 @@ pub struct AppState {
     pub ops: Arc<dyn Ops>,
     /// Tunnels with an action under way ("*": restart all), so two never overlap.
     pub busy: Mutex<HashSet<String>>,
+    /// Serialize pair allocation/creation within this hub. Each endpoint also rechecks under its store lock.
+    pub tun_creates: tokio::sync::Mutex<()>,
     /// Live logs being watched.
     pub followers: Arc<Semaphore>,
     /// Other servers (agents); `None` in the demo, which shows sample servers.
@@ -1128,7 +1130,7 @@ async fn tool_answer_owned(state: Arc<AppState>, server: String, name: String, o
         return unauthorized();
     }
     let ip = client_ip(&request);
-    if !["speedtest", "pairing", "quota_reset"].contains(&op.as_str()) {
+    if !["speedtest", "pairing", "quota_reset", "tun_probe"].contains(&op.as_str()) {
         return error(StatusCode::NOT_FOUND, "unknown_tool");
     }
     if server == "local" && !tunnel_names(&state).await.contains(&name) {
@@ -1156,6 +1158,7 @@ async fn tool_answer_owned(state: Arc<AppState>, server: String, name: String, o
     let what = match op.as_str() {
         "speedtest" => "speed test",
         "pairing" => "pairing code",
+        "tun_probe" => "TUN peer connectivity test",
         _ => "traffic count reset",
     };
     let mut request = body;
@@ -2422,10 +2425,26 @@ async fn new_tunnel_owned(State(state): State<Arc<AppState>>, request: Request) 
     }
     // A failover tunnel lists its carriers; any other names one transport.
     let failover = form["carriers"].is_array();
-    let built = match if failover { super::wizard::build_failover(&form) } else { super::wizard::build(&form) } {
-        Ok(built) => built,
-        Err(problem) => return failed(StatusCode::BAD_REQUEST, format!("{problem:#}")),
+    let tun = super::wizard::wants_tun(&form);
+    let ordinary = if !tun {
+        match if failover { super::wizard::build_failover(&form) } else { super::wizard::build(&form) } {
+            Ok(built) => Some(built),
+            Err(problem) => return failed(StatusCode::BAD_REQUEST, format!("{problem:#}")),
+        }
+    } else {
+        if failover { return failed(StatusCode::BAD_REQUEST, "TUN requires one carrier, not failover".into()); }
+        if let Err(problem) = crate::manager::plan::check_name(form["name"].as_str().unwrap_or("").trim()) {
+            return failed(StatusCode::BAD_REQUEST, format!("{problem:#}"));
+        }
+        None
     };
+    // No writes before both agents confirm that they understand this operation.
+    let _allocation = if tun {
+        match tokio::time::timeout(ACTION_TIMEOUT, state.tun_creates.lock()).await {
+            Ok(guard) => Some(guard),
+            Err(_) => return error(StatusCode::CONFLICT, "busy"),
+        }
+    } else { None };
     let name = form["name"].as_str().unwrap_or("").trim().to_string();
     let key_of = |at: &str| if at == "local" { name.clone() } else { format!("{at}/{name}") };
     if [&iran_at, &foreign_at].iter().any(|at| state.busy.lock().unwrap().contains(&format!("{at}/*"))) {
@@ -2448,6 +2467,28 @@ async fn new_tunnel_owned(State(state): State<Arc<AppState>>, request: Request) 
             Err(problem) => return failed(StatusCode::BAD_GATEWAY, format!("{problem:#}")),
         }
     }
+    let built = if let Some(built) = ordinary {
+        Ok(built)
+    } else {
+        let mut inventories = Vec::new();
+        for at in [&iran_at, &foreign_at] {
+            let inventory: crate::manager::tun_resources::Inventory = if real(at) {
+                let result = run_on(&state, at, json!({"op": "tun_inventory"}), ACTION_TIMEOUT).await
+                    .and_then(|value| Ok(serde_json::from_value(value)?));
+                match result {
+                    Ok(inventory) => inventory,
+                    Err(problem) => return failed(StatusCode::BAD_GATEWAY,
+                        format!("TUN resources on {at}: {problem:#}. Both servers need TUN-capable EZTunnel and Linux prerequisites.")),
+                }
+            } else { Default::default() };
+            inventories.push(inventory);
+        }
+        super::wizard::build_tun(&form, &inventories[0], &inventories[1])
+    };
+    let built = match built {
+        Ok(built) => built,
+        Err(problem) => return failed(StatusCode::BAD_REQUEST, format!("{problem:#}")),
+    };
     let transport = if failover {
         let order: Vec<&str> = form["carriers"].as_array().into_iter().flatten().filter_map(|c| c["transport"].as_str()).collect();
         format!("failover {}", order.join(" > "))
@@ -2538,6 +2579,9 @@ async fn new_tunnel_owned(State(state): State<Arc<AppState>>, request: Request) 
     }
     drop(busy);
     state.live.refresh();
+    if tun {
+        report.insert("tun".into(), json!({"iran": built.iran["tun"], "foreign": built.foreign["tun"]}));
+    }
     report.insert("ok".into(), json!(true));
     report.insert("name".into(), json!(name));
     Json(Value::Object(report)).into_response()
@@ -2894,6 +2938,7 @@ mod tests {
             live: Live::start(Box::new(super::super::data::DemoSource::new()), None),
             ops: Arc::new(demo_ops()),
             busy: Default::default(),
+            tun_creates: Default::default(),
             followers: Arc::new(Semaphore::new(MAX_FOLLOWERS)),
             fleet: None,
             public: ("203.0.113.10".into(), 38_471),
@@ -3301,6 +3346,48 @@ mod tests {
         assert_eq!(call(&app, create(raw, true)).await.status(), StatusCode::BAD_REQUEST);
         let events = state.audit.recent(5);
         assert!(events.iter().any(|e| e["detail"].as_str().unwrap_or("").starts_with("create new-game (tcp;")), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn dashboard_tun_allocates_pairs_serially_and_refuses_manual_conflicts() {
+        let (app, state) = app().await;
+        let cookie = signed_in(&app).await;
+        let form = |name: &str| json!({"name":name, "iran":"local", "foreign":"other",
+            "transport":"tcp","direction":"reverse","address":"192.0.2.1","carry":"tun"});
+        let create = |value: Value| with_cookie(post("/api/new-tunnel", &value.to_string(), true), &cookie);
+        let (a,b) = tokio::join!(call(&app, create(form("tun-a"))), call(&app, create(form("tun-b"))));
+        assert_eq!(a.status(), StatusCode::OK);
+        assert_eq!(b.status(), StatusCode::OK);
+        let (a,b) = (json_of(a).await, json_of(b).await);
+        assert_ne!(a["tun"]["iran"]["address"], b["tun"]["iran"]["address"]);
+        assert_ne!(a["tun"]["iran"]["name"], b["tun"]["iran"]["name"]);
+        assert_eq!(a["tun"]["iran"]["address"], a["tun"]["foreign"]["peer_address"]);
+        assert_eq!(a["tun"]["foreign"]["address"], a["tun"]["iran"]["peer_address"]);
+        let mut conflict = form("conflict");
+        conflict["tun_mode"] = json!("manual");
+        conflict["tun_iran"] = a["tun"]["iran"]["address"].clone();
+        conflict["tun_foreign"] = a["tun"]["foreign"]["address"].clone();
+        assert_eq!(call(&app, create(conflict)).await.status(), StatusCode::BAD_REQUEST);
+        assert!(!tunnel_names(&state).await.contains(&"conflict".into()));
+        let probe = call(&app, with_cookie(post("/api/tunnels/tun-a/tools/tun_probe", "{}", true), &cookie)).await;
+        assert_eq!(probe.status(), StatusCode::OK);
+        let reply = json_of(probe).await;
+        assert_eq!(reply["demo"], true);
+        assert_eq!(reply["target"]["peer_address"], reply["peer"]);
+        let exact = json!({"expect_tun": reply["target"]});
+        let request = with_cookie(post("/api/tunnels/tun-a/tools/tun_probe", &exact.to_string(), true), &cookie);
+        let exact_reply = call(&app, request).await;
+        assert_eq!(exact_reply.status(), StatusCode::OK);
+        assert_eq!(json_of(exact_reply).await["target"], exact["expect_tun"]);
+        for (field, changed) in [("interface", json!("other")), ("address", json!("10.2.3.4")),
+            ("peer_address", json!("10.2.3.5")), ("mtu", json!(1320)), ("pair", Value::Null)] {
+            let mut stale = exact.clone();
+            stale["expect_tun"][field] = changed;
+            let request = with_cookie(post("/api/tunnels/tun-a/tools/tun_probe", &stale.to_string(), true), &cookie);
+            assert_eq!(call(&app, request).await.status(), StatusCode::CONFLICT, "{field}");
+        }
+        let wrong = with_cookie(post("/api/tunnels/tun-a/tools/tun_probe", r#"{"expect_pair":"0000000000000000"}"#, true), &cookie);
+        assert_eq!(call(&app, wrong).await.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

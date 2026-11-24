@@ -296,7 +296,7 @@ enum FleetCommand {
         name: String,
         #[arg(long, default_value = "local")]
         server: String,
-        #[arg(value_parser = ["speedtest", "pairing", "quota_reset"])]
+        #[arg(value_parser = ["speedtest", "pairing", "quota_reset", "tun_probe"])]
         tool: String,
         #[arg(long)]
         form: Option<PathBuf>,

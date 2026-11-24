@@ -26,6 +26,7 @@ pub mod service;
 pub mod speed;
 pub mod store;
 pub mod tune;
+pub mod tun_resources;
 pub mod ui;
 pub mod update;
 pub mod wizard;

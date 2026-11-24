@@ -91,7 +91,7 @@
     const parts = [];
     if (x.carry?.ports?.length) parts.push([t("ports"), x.carry.ports.join(", ")]);
     if (x.carry?.socks) parts.push([t("socks"), ""]);
-    if (x.carry?.tun) parts.push([t("tun"), ""]);
+    if (x.carry?.tun) parts.push([t("tun"), x.tun?.address ?? ""]);
     if (x.carry?.exits?.length) parts.push([t("exits"), x.carry.exits.join(", ")]);
     return parts;
   }

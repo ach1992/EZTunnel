@@ -13,7 +13,7 @@
   import { live } from "../lib/live.svelte.js";
   import { fleet, fleetSeries, LOCAL } from "../lib/servers.svelte.js";
   import { getStatus, runTool } from "../lib/api.js";
-  import { pending, pendingKey, ask, say } from "../lib/actions.svelte.js";
+  import { pending, pendingKey, ask, say, otherEnds } from "../lib/actions.svelte.js";
   import { t, num, pct, amount, duration, rate as mbit } from "../lib/i18n.svelte.js";
   import { tunnelState, transportLabel, shownTransport, isUp, linkState, own } from "../lib/view.js";
   import LinkLine from "../lib/LinkLine.svelte";
@@ -162,6 +162,65 @@
     }
   }
 
+  // The other interface is shown only when the managed pair is unambiguous.
+  const tunPeer = $derived.by(() => {
+    if (!x?.tun) return null;
+    const candidates = otherEnds(name, server, x.pair).map((end) => {
+      const snapshot = end.server === LOCAL ? live.snapshot : fleet.list.find((s) => s.id === end.server)?.snapshot;
+      return { ...end, tunnel: snapshot?.tunnels?.find((tunnel) => tunnel.name === end.name) };
+    }).filter((end) => end.tunnel?.tun && end.tunnel.side !== x.side
+      && end.tunnel.tun.address === x.tun.peer_address && end.tunnel.tun.peer_address === x.tun.address);
+    return candidates.length === 1 ? candidates[0] : null;
+  });
+  let probeResults = $state([]);
+  let probeBusy = $state(false);
+  let probeGeneration = 0;
+  // Snapshots replace the tunnel object every tick. Reset only when its identity
+  // changes, not when fresh traffic or interface state arrives.
+  function probeTarget(tunnel) {
+    if (!tunnel?.tun) return null;
+    return { pair: tunnel.pair ?? null, interface: tunnel.tun.interface,
+      address: tunnel.tun.address, peer_address: tunnel.tun.peer_address, mtu: tunnel.tun.mtu };
+  }
+  function targetKey(target) {
+    return target ? JSON.stringify([target.pair, target.interface, target.address,
+      target.peer_address, target.mtu]) : null;
+  }
+  const probeIdentity = $derived(JSON.stringify([name, server, targetKey(probeTarget(x)),
+    tunPeer ? [tunPeer.server, tunPeer.name, targetKey(probeTarget(tunPeer.tunnel))] : null]));
+  $effect(() => {
+    probeIdentity;
+    untrack(() => { probeGeneration++; probeResults = []; probeBusy = false; });
+  });
+  async function probeTun() {
+    if (probeBusy || pending[busyKey] || !x?.tun) return;
+    const generation = ++probeGeneration;
+    const identity = probeIdentity;
+    const endpoints = [{ server, name, address: x.tun.address, target: probeTarget(x), label: t("tunLocalIp") }];
+    if (tunPeer?.online) endpoints.push({ server: tunPeer.server, name: tunPeer.name,
+      address: tunPeer.tunnel.tun.address, target: probeTarget(tunPeer.tunnel), label: t("tunPeerIp") });
+    probeBusy = true;
+    probeResults = endpoints.map((end) => ({ ...end, waiting: true }));
+    await Promise.all(endpoints.map(async (end, i) => {
+      const key = pendingKey(end.name, end.server);
+      let row = { ...end, waiting: false };
+      if (pending[key]) row.error = t("busyT");
+      else {
+        pending[key] = "tun_probe";
+        try {
+          const { status: code, data } = await runTool(end.name, "tun_probe", { expect_tun: end.target }, end.server);
+          if (code === 200) {
+            if (targetKey(data?.target) === targetKey(end.target)) row.result = data;
+            else row.error = t("tunProbeChanged");
+          } else row.error = data?.detail ?? t("failedShort");
+        } catch { row.error = t("slowShort"); }
+        finally { delete pending[key]; }
+      }
+      if (generation === probeGeneration && identity === probeIdentity) probeResults[i] = row;
+    }));
+    if (generation === probeGeneration && identity === probeIdentity) probeBusy = false;
+  }
+
   // Pairing code.
   let pairing = $state(null);
   let pairAddress = $state("");
@@ -245,6 +304,52 @@
       <div><b>{isUp(x) ? rate(x.up_bps) : "-"}</b><span>{t("up")}</span></div>
     </div>
   </section>
+
+  {#if x.tun}
+    <section class="panel mb16" aria-labelledby="tp-tun">
+      <h3 id="tp-tun" class="sec-h">{t("tunDetails")}</h3>
+      <div class="new-ends">
+        <div class="new-end">
+          <span class="muted small">{t("tunLocalIp")}</span>
+          <b class="ltr">{x.tun.address}</b>
+          <span class="small ltr">{x.tun.interface} · MTU {num(x.tun.mtu)}</span>
+          <span class="small">{t(x.tun.interface_ready == null ? "tunInterfaceUnknown" : x.tun.interface_ready ? "tunInterfaceReady" : "tunInterfaceDown")}</span>
+        </div>
+        <div class="new-end">
+          <span class="muted small">{t("tunPeerIp")}{#if tunPeer} · {tunPeer.serverName}{/if}</span>
+          <b class="ltr">{x.tun.peer_address}</b>
+          {#if tunPeer?.tunnel?.tun}
+            <span class="small ltr">{tunPeer.tunnel.tun.interface} · MTU {num(tunPeer.tunnel.tun.mtu)}</span>
+            <span class="small">{t(!tunPeer.online || tunPeer.tunnel.tun.interface_ready == null ? "tunInterfaceUnknown" : tunPeer.tunnel.tun.interface_ready ? "tunInterfaceReady" : "tunInterfaceDown")}</span>
+          {:else}
+            <span class="small muted">{t("tunInterfaceUnknown")}</span>
+          {/if}
+        </div>
+      </div>
+      {#if x.tun.forwarding_port}
+        <p class="small muted mt8">{t("tunRelayPort")}: <b class="ltr">{x.tun.forwarding_port}</b></p>
+      {/if}
+      <p class="small muted mt12">{t("tunProbeHelp")}</p>
+      <button class="btn" onclick={probeTun} disabled={probeBusy || Boolean(pending[busyKey])} aria-busy={probeBusy}>
+        {probeBusy ? t("tunProbing") : t("tunProbe")}
+      </button>
+      {#if probeResults.length}
+        <div class="mt12" aria-live="polite">
+          {#each probeResults as row}
+            <div class="new-end mt8">
+              <b><span class="ltr">{row.address}</span> · {row.label}</b>
+              {#if row.waiting}<span class="small muted">{t("tunProbing")}</span>
+              {:else if row.error}<span class="small bad-t">{row.error}</span>
+              {:else if row.result}
+                <span class="small {row.result.reachable ? '' : 'warn-t'}">{t(!row.result.attempted ? "tunProbeNotReady" : row.result.reachable ? "tunProbeOk" : "tunProbeFail")}</span>
+                {#if row.result.detail}<span class="small muted ltr">{row.result.detail}</span>{/if}
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
+  {/if}
 
   {@const fo = status?.failover ?? x.failover}
   {#if fo}
