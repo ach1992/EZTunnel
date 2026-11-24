@@ -29,6 +29,8 @@ jobs:
         with:
           toolchain: 1.88.0
       - run: bash scripts/test-installer-services.sh
+      - name: Exercise join bootstrap paths in an isolated container
+        run: docker run --rm --network none --mount "type=bind,source=$PWD,target=/repo,readonly" ubuntu:22.04 bash /repo/scripts/test-join.sh
       - run: cargo test --locked --no-default-features --features dashboard --lib
       - run: cargo test --locked --no-default-features --features dashboard --test fleet_cli
       - run: cargo check --locked --no-default-features

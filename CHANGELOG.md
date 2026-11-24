@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.0-ach.5 (2026-11-24)
+
+- Build the full-featured x86-64 and ARM64 releases natively on Ubuntu 22.04 (GLIBC 2.35 baseline), with exact-binary runtime checks on Ubuntu 22.04/24.04 and Debian 12/13 before publication.
+- Keep the Dashboard Join installer's real download, loader and installation errors visible. Check the release in a private temporary prefix and install that same version, rather than resolving latest a second time.
+
 ## 0.13.0-ach.4 (2026-11-24)
 
 - Create paired private IP tunnels (TUN and TUN + port forwarding) from Dashboard/Fleet with automatic or manual IPv4/IPv6 addresses, MTU and collision-checked interface names and relay ports.

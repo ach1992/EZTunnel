@@ -25,22 +25,37 @@ fi
 
 work=$(mktemp -d /root/.eztunnel-join.XXXXXXXX)
 trap 'rm -rf -- "$work"' EXIT
-printf 'Checking the latest EZTunnel release (in %s; nothing is installed yet) ...\n' "$work"
-curl -fsSL "$installer" -o "$work/install-latest.sh"
-EZTUNNEL_NO_MENU=1 bash "$work/install-latest.sh" --prefix "$work/try" >/dev/null 2>&1
-if ! can_join "$work/try/bin/eztunnel"; then
+printf 'Checking the latest EZTunnel release (temporary directory: %s; the system installation is unchanged) ...\n' "$work"
+if ! curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60 "$installer" -o "$work/install-latest.sh"; then
+  die 'Could not download the EZTunnel installer. Nothing on this server was changed.'
+fi
+# Keep the installer's own diagnostics, including the dynamic loader error when a release
+# cannot run on this host. Only the temporary prefix is used during this check.
+if ! bash "$work/install-latest.sh" --prefix "$work/try" --no-menu; then
+  die 'Could not prepare a runnable EZTunnel release. Nothing on this server was changed.'
+fi
+candidate="$work/try/bin/eztunnel"
+if ! "$candidate" agent --help >/dev/null; then
   die 'The latest EZTunnel release cannot join a dashboard yet. Nothing on this server was changed.'
 fi
+checked_version=$("$candidate" --version) || die 'Could not read the prepared release version. Nothing on this server was changed.'
+# Install the same version that was actually checked, even if GitHub latest moves in between.
+version=${checked_version#eztunnel }
+[[ $checked_version == "eztunnel $version" && -n $version ]] || die 'Unexpected prepared release version. Nothing on this server was changed.'
 
 if [[ -x $installed ]]; then
   printf '\nThis server has %s, which cannot join a dashboard.\n' "$("$installed" --version 2>/dev/null || echo 'an older EZTunnel')"
-  printf 'It will be updated to %s.\n' "$("$work/try/bin/eztunnel" --version)"
+  printf 'It will be updated to %s.\n' "$checked_version"
   printf 'Running tunnels are not restarted and keep the version they started with; the old program is kept as a backup.\n'
   if [[ -t 0 ]]; then
     read -r -p 'Update and join now? [Y/n] ' answer
     [[ -z $answer || $answer == [Yy]* ]] || die 'Stopped. Nothing on this server was changed.'
   fi
 fi
-EZTUNNEL_NO_MENU=1 bash "$work/install-latest.sh"
-can_join "$installed" || die 'The installed program cannot join a dashboard.'
+if ! bash "$work/install-latest.sh" --version "v$version" --no-menu; then
+  die 'EZTunnel installation did not complete successfully; see the installer output above. Join was not attempted.'
+fi
+if ! "$installed" agent --help >/dev/null; then
+  die 'The installed program cannot join a dashboard.'
+fi
 "$installed" agent join "$code"

@@ -38,7 +38,9 @@ config files to write.
   goes to the peers and targets you configure; explicit Release downloads and optional
   certificate issuance contact GitHub and your certificate authority.
 
-## What's new in the ACh fork (0.13.0-ach.4)
+## What's new in the ACh fork (0.13.0-ach.5)
+
+- **Linux compatibility:** full-featured releases target glibc 2.35 (Ubuntu 22.04 and Debian 12 or newer); Dashboard Join displays installer failures instead of silently exiting.
 
 - **Private IP tunnels:** create paired TUN or TUN + port-forwarding links from the Dashboard and Fleet CLI with automatic or manual IPv4/IPv6, MTU and collision-checked resource allocation. Inspect each endpoint and test peer connectivity. [Dashboard TUN guide](docs/dashboard.md#private-ip-tunnels-tun).
 - **Dashboard layout:** uses the available desktop width while retaining responsive navigation.
@@ -90,7 +92,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ach1992/EZTunnel/main/script
 The installer picks the right build for your CPU (x86_64 or ARM64), checks it
 against the release's `SHA256SUMS`, installs `/usr/local/bin/eztunnel` and then opens the manager. It
 never starts, stops or changes existing tunnels. The fork's official binaries target
-GNU/Linux with glibc 2.39 and standard Ubuntu 24.04 shared libraries;
+GNU/Linux with glibc 2.35 and compatible standard shared libraries (including Ubuntu 22.04/24.04 and Debian 12/13);
 they are not static musl builds. See [Linux architectures](docs/architectures.md).
 
 <details>
@@ -100,7 +102,7 @@ they are not static musl builds. See [Linux architectures](docs/architectures.md
 curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh
 less install-eztunnel.sh
 sudo bash install-eztunnel.sh                      # latest release
-sudo bash install-eztunnel.sh --version v0.13.0-ach.4  # pin this fork release
+sudo bash install-eztunnel.sh --version v0.13.0-ach.5  # pin this fork release
 sudo bash install-eztunnel.sh --no-menu            # install only, do not open the manager
 ```
 

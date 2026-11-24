@@ -5,20 +5,25 @@
 The `ach1992/EZTunnel` one-line installer downloads the fork's official
 `eztunnel-linux-x86_64.tar.gz` or `eztunnel-linux-aarch64.tar.gz`.
 These **full-featured GNU/Linux builds are dynamically linked**, produced
-natively on Ubuntu 24.04 x86-64 and ARM64 GitHub runners. They are **not**
+natively on Ubuntu 22.04 x86-64 and ARM64 GitHub runners. They are **not**
 the optional static musl binaries documented below.
 
-The compatibility baseline for these artifacts is **glibc 2.39 and the
-standard shared runtime libraries available on Ubuntu 24.04**, on the
-corresponding architecture. Ubuntu 24.04 and newer and Debian 13 are the
-intended system families for this fork; use actual ELF requirements, not
-a hard-coded OS-name prohibition, for other distributions. The build job
-records ELF machine, interpreter, shared libraries and required GLIBC
-symbol versions in the `elf-abi.txt` artifact, checks the ABI against
-Ubuntu 24.04 and runs `eztunnel --version` before publishing. A program
-that cannot start on a target host is rejected by the installer **before**
-it replaces an installed executable. Real cross-distribution and
-two-architecture installation still require post-Release acceptance.
+The compatibility baseline for these artifacts is **glibc 2.35 and compatible
+standard shared runtime libraries**, on the corresponding architecture.
+Ubuntu 22.04/24.04 and Debian 12/13 are the release-tested system families.
+The build job records ELF machine, interpreter, shared libraries and required
+GLIBC symbol versions in the `elf-abi.txt` artifact, rejects GLIBC requirements
+above 2.35, and installs and executes the exact release binary in clean containers of
+each of those four distributions on each native architecture. These smoke
+checks use the real installer with local, checksum-verified release fixtures
+before publication and cover executable version and Agent/Dashboard command availability,
+not all kernel or systemd features. Use actual runtime requirements, not a
+hard-coded OS-name prohibition, for other distributions. A program that cannot
+start on a target host is rejected by the installer **before** it replaces an
+installed executable. Dashboard Join retains the installer's diagnostics if
+the temporary compatibility check fails. Older glibc systems (for example
+Debian 11) are not guaranteed by these official GNU builds; the separate static
+musl source-build path remains available.
 
 An x86-64 host selects `x86_64`/`amd64`; ARM64 selects
 `aarch64`/`arm64`. Both include browser-compatible TLS and all default
