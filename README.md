@@ -38,6 +38,11 @@ config files to write.
   goes to the peers and targets you configure; explicit Release downloads and optional
   certificate issuance contact GitHub and your certificate authority.
 
+## What's new in the ACh fork (0.13.0-ach.4)
+
+- **Private IP tunnels:** create paired TUN or TUN + port-forwarding links from the Dashboard and Fleet CLI with automatic or manual IPv4/IPv6, MTU and collision-checked resource allocation. Inspect each endpoint and test peer connectivity. [Dashboard TUN guide](docs/dashboard.md#private-ip-tunnels-tun).
+- **Dashboard layout:** uses the available desktop width while retaining responsive navigation.
+
 ## What's new in 0.13.0
 
 - **Failover**: one tunnel with 2 to 4 transports behind the same user ports, for example TCP,
@@ -95,7 +100,7 @@ they are not static musl builds. See [Linux architectures](docs/architectures.md
 curl -fsSLo install-eztunnel.sh https://raw.githubusercontent.com/ach1992/EZTunnel/main/scripts/install-latest.sh
 less install-eztunnel.sh
 sudo bash install-eztunnel.sh                      # latest release
-sudo bash install-eztunnel.sh --version v0.13.0-ach.2  # pin this fork release
+sudo bash install-eztunnel.sh --version v0.13.0-ach.4  # pin this fork release
 sudo bash install-eztunnel.sh --no-menu            # install only, do not open the manager
 ```
 
