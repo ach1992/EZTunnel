@@ -175,8 +175,11 @@
   let probeResults = $state([]);
   let probeBusy = $state(false);
   let probeGeneration = 0;
+  // Snapshots replace the tunnel object every tick. Reset only when its identity
+  // changes, not when fresh traffic or interface state arrives.
+  const probeIdentity = $derived(JSON.stringify([name, server, x?.pair ?? null]));
   $effect(() => {
-    name; server; x?.pair;
+    probeIdentity;
     untrack(() => { probeGeneration++; probeResults = []; probeBusy = false; });
   });
   async function probeTun() {
